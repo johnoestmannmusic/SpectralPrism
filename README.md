@@ -17,12 +17,11 @@ Built in Rust on top of [nih-plug](https://github.com/robbert-vdh/nih-plug).
   texture/movement against memory and export file size. The loop is phase-locked
   and reconstructed with circular overlap-add, so it repeats with no audible seam
   at any length.
-- Full polyphony (up to 16 voices) with per-voice ADSR envelope, velocity
+- **Full polyphony** (up to 16 voices) with per-voice **ADSR envelope**, velocity
   sensitivity, pitch bend, and a per-voice pan randomizer.
-- JSON preset files (import/export via file dialog, plus a simple named on-disk
-  library), with self-healing sample-path recovery if a shared preset's sample
-  can't be found on the machine it's loaded on.
-- Export the current frozen loop as a WAV file, e.g. for use in a tracker or sampler.
+- **JSON Preset files** (import/export via file dialog, plus a simple named on-disk
+  library), with sample-path recovery if a shared preset's sample can't be found on the machine it's loaded on.
+- **Export WAV** - export the current frozen loop as a WAV file, e.g. for use in a tracker or sampler.
 
 ## Building from source
 
@@ -70,6 +69,7 @@ This doesn't affect the DSP core (`prism_dsp`) or the CLI harness
 doesn't restrict what you can do with this project's own source code - it's
 specifically about the license terms that apply to a compiled, distributed
 VST3 binary.
+Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://steinbergmedia.github.io/vst3_dev_portal/pages/Versions/Version+3.8.0.html). It appears that nih-plug has not been relicensed at this stage.
 
 ## Credits
 
