@@ -74,5 +74,4 @@ Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://ste
 ## Credits
 
 - Built on [nih-plug](https://github.com/robbert-vdh/nih-plug) by Robbert van der Helm.
-- The freeze algorithm was originally prototyped as a browser-based audio
-  experiment before being ported to this standalone Rust plugin.
+- The freeze algorithm was originally prototyped in my [1000 - shrines - /of/ - SPIRIT](https://github.com/johnoestmannmusic/1000-shrines-of-spirit) before being spun out as its own plugin.
