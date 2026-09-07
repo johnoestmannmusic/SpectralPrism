@@ -1,0 +1,63 @@
+name: Build
+
+# GUI plugins built on nih-plug/baseview have real platform-specific
+# windowing code, so each bundle is built natively on its own OS rather than
+# cross-compiled - that's the standard, reliable approach for this kind of
+# project.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgl1-mesa-dev \
+            libjack-jackd2-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Bundle plugin
+        run: cargo xtask bundle prism_plugin --release
+
+      - name: Upload bundled plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectralPrism-${{ matrix.name }}
+          path: |
+            target/bundled/*.vst3
+            target/bundled/*.clap
+          if-no-files-found: error
