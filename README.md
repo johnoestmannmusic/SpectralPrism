@@ -75,3 +75,6 @@ Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://ste
 
 - Built on [nih-plug](https://github.com/robbert-vdh/nih-plug) by Robbert van der Helm.
 - The freeze algorithm was originally prototyped in my [1000 - shrines - /of/ - SPIRIT](https://github.com/johnoestmannmusic/1000-shrines-of-spirit) before being spun out as its own plugin.
+
+## AI Disclosure
+- GenAI was used to assist the programming of this software
