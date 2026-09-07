@@ -35,6 +35,7 @@ jobs:
             libasound2-dev \
             libgl1-mesa-dev \
             libjack-jackd2-dev \
+            libwayland-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
