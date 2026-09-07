@@ -1,5 +1,7 @@
 # SpectralPrism
 
+<img width="1920" height="1080" alt="SpectralPrism-Snapshot" src="https://github.com/user-attachments/assets/2e363f58-13e9-41f2-9308-291b1df1d783" />
+
 A phase-vocoder "freeze" instrument: load a sample, freeze a spectral
 snapshot of it into a sustained, evolving pad/drone, and play it back
 polyphonically via MIDI. Available as a VST3 and CLAP plugin, and as a
