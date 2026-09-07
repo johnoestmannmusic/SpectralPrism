@@ -67,16 +67,13 @@ VST3 bindings, which are an external dependency licensed under
 *compiled* VST3 binary built from this project is a combined work subject to
 GPL-3.0's terms, independent of this project's own MIT license on its source.
 This doesn't affect the DSP core (`prism_dsp`) or the CLI harness
-(`prism_cli`), neither of which touch nih-plug's VST3 bindings at all, and it
-doesn't restrict what you can do with this project's own source code - it's
+(`prism_cli`), neither of which touch nih-plug's VST3 bindings, and it
+doesn't restrict what you can do with this project's own source code. It's
 specifically about the license terms that apply to a compiled, distributed
 VST3 binary.
-Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://steinbergmedia.github.io/vst3_dev_portal/pages/Versions/Version+3.8.0.html). It appears that nih-plug has not been relicensed at this stage.
 
-## Credits
+_Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://steinbergmedia.github.io/vst3_dev_portal/pages/Versions/Version+3.8.0.html). It appears that nih-plug has not been relicensed at this stage._
 
-- Built on [nih-plug](https://github.com/robbert-vdh/nih-plug) by Robbert van der Helm.
-- The freeze algorithm was originally prototyped in my [1000 - shrines - /of/ - SPIRIT](https://github.com/johnoestmannmusic/1000-shrines-of-spirit) before being spun out as its own plugin.
 
 ## AI Disclosure
 - GenAI was used to assist the programming of this software
