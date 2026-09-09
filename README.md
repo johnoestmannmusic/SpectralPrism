@@ -76,4 +76,4 @@ _Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://st
 
 
 ## AI Disclosure
-- GenAI was used to assist the programming of this software
+GenAI was used to assist the programming of this software. To learn more about my current thoughts around this, please read this post: https://johnoestmannmusic.com/ai-building-exoskeletons
