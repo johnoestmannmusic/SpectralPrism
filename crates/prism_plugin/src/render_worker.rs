@@ -1,21 +1,23 @@
 use arc_swap::ArcSwap;
-use prism_dsp::render::{render_frozen_loop, LoopBufferData};
+use prism_dsp::fusion::{effective_mode, render_fused_loop, FusionMode, FusionRenderParams};
+use prism_dsp::render::LoopBufferData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-/// Freeze Point / Formant Shift / Stereo Width are all render-time
-/// operations on the source sample (see `render::render_frozen_loop`) -
-/// none of them are cheap per-sample transforms, so they can't just be read
-/// on the audio thread. A single background thread renders on demand and
-/// publishes the result into a shared `ArcSwap` the audio thread reads
-/// lock-free.
+/// Freeze Point / Formant Shift / Stereo Width / Spectral Fusion are all
+/// render-time operations on the source sample(s) (see
+/// `prism_dsp::fusion::render_fused_loop`) - none of them are cheap
+/// per-sample transforms, so they can't just be read on the audio thread. A
+/// single background thread renders on demand and publishes the result into
+/// a shared `ArcSwap` the audio thread reads lock-free.
 #[derive(Clone, Copy, PartialEq)]
 pub struct RenderRequest {
     pub freeze_point_pct: f32,
     pub formant_shift_semitones: f32,
     pub stereo_width_pct: f32,
     pub loop_length_seconds: f32,
+    pub fusion: FusionRenderParams,
 }
 
 /// A cheap-to-clone handle for asking the render worker to render again -
@@ -56,10 +58,11 @@ impl Default for RenderTrigger {
 /// request) so a fast automation sweep can't back the worker up with a
 /// queue of stale renders to work through.
 ///
-/// `source` is an `ArcSwap` (not a fixed `Arc` captured at spawn time) so
-/// loading a new sample (Phase E) can swap it out - the worker always reads
-/// whatever the *current* source is at the moment a request comes in, not
-/// whatever it was when the thread started.
+/// `source`/`source_b` are `ArcSwap`s (not a fixed `Arc` captured at spawn
+/// time) so loading a new sample (Phase E; Sample B for Spectral Fusion)
+/// can swap it out - the worker always reads whatever the *current* source
+/// is at the moment a request comes in, not whatever it was when the thread
+/// started.
 pub struct RenderWorker {
     trigger: RenderTrigger,
     stop: Arc<AtomicBool>,
@@ -85,6 +88,7 @@ impl RenderWorker {
     pub fn spawn(
         trigger: RenderTrigger,
         source: Arc<ArcSwap<Vec<Vec<f32>>>>,
+        source_b: Arc<ArcSwap<Vec<Vec<f32>>>>,
         sample_rate: f32,
         root_note: u8,
         output: Arc<ArcSwap<LoopBufferData>>,
@@ -109,11 +113,17 @@ impl RenderWorker {
                 };
 
                 let current_source = source.load();
-                let rendered = render_frozen_loop(
+                let current_source_b = source_b.load();
+                // See `prism_dsp::fusion::effective_mode`'s doc comment for
+                // why this degrade happens here (not to the param itself).
+                let effective_fusion = FusionRenderParams { mode: effective_mode(request.fusion.mode, &current_source_b), ..request.fusion };
+                let rendered = render_fused_loop(
                     &current_source,
+                    &current_source_b,
                     sample_rate,
                     request.freeze_point_pct,
                     request.formant_shift_semitones,
+                    &effective_fusion,
                     request.stereo_width_pct,
                     request.loop_length_seconds,
                     root_note,
@@ -152,6 +162,12 @@ mod tests {
         Arc::new(ArcSwap::new(Arc::new(vec![tone])))
     }
 
+    /// Sample B starts genuinely empty until the user loads one - see
+    /// `worker_falls_back_to_off_when_b_requiring_mode_has_no_sample_b_loaded`.
+    fn make_empty_source() -> Arc<ArcSwap<Vec<Vec<f32>>>> {
+        Arc::new(ArcSwap::new(Arc::new(Vec::new())))
+    }
+
     fn wait_for_render(output: &ArcSwap<LoopBufferData>, timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -174,12 +190,14 @@ mod tests {
         assert!(output.load().channels.is_empty());
 
         let trigger = RenderTrigger::new();
-        let _worker = RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        let _worker =
+            RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams::default(),
         });
 
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish a render in time");
@@ -204,6 +222,7 @@ mod tests {
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams::default(),
         });
 
         let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
@@ -211,7 +230,7 @@ mod tests {
             sample_rate,
             root_note: DEFAULT_ROOT_NOTE,
         })));
-        let _worker = RenderWorker::spawn(trigger, make_source(sample_rate, 1.0), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        let _worker = RenderWorker::spawn(trigger, make_source(sample_rate, 1.0), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
 
         assert!(wait_for_render(&output, Duration::from_secs(2)), "the pre-spawn request was never processed");
         assert_eq!(output.load().channels.len(), 2);
@@ -227,7 +246,8 @@ mod tests {
         })));
 
         let trigger = RenderTrigger::new();
-        let _worker = RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        let _worker =
+            RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         // Fire a burst of superseding requests - the mailbox should collapse
         // these down rather than queueing every one of them.
         for freeze_point_pct in [10.0, 20.0, 30.0, 40.0, 50.0] {
@@ -236,6 +256,7 @@ mod tests {
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 0.0,
                 loop_length_seconds: DEFAULT_LOOP_SECONDS,
+                fusion: FusionRenderParams::default(),
             });
         }
 
@@ -261,12 +282,13 @@ mod tests {
         })));
 
         let trigger = RenderTrigger::new();
-        let _worker = RenderWorker::spawn(trigger.clone(), source.clone(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        let _worker = RenderWorker::spawn(trigger.clone(), source.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         let request = RenderRequest {
             freeze_point_pct: 50.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams::default(),
         };
         trigger.request_render(request);
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the first render in time");
@@ -291,5 +313,80 @@ mod tests {
         let second_render = output.load().channels[0].clone();
         assert_eq!(first_render.len(), second_render.len(), "loop_length_seconds is unchanged, so both renders should be the same length");
         assert_ne!(first_render, second_render, "expected the swapped-in source to produce different audio");
+    }
+
+    #[test]
+    fn worker_falls_back_to_off_when_b_requiring_mode_has_no_sample_b_loaded() {
+        let sample_rate = 48000.0;
+        let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
+            channels: Vec::new(),
+            sample_rate,
+            root_note: DEFAULT_ROOT_NOTE,
+        })));
+
+        let source_a = make_source(sample_rate, 1.0);
+        let trigger = RenderTrigger::new();
+        let _worker = RenderWorker::spawn(trigger.clone(), source_a, make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        // Audition needs Sample B, but none was ever loaded (make_empty_source) -
+        // this must degrade to Off (plain Sample A) rather than panic on an
+        // empty source.
+        trigger.request_render(RenderRequest {
+            freeze_point_pct: 50.0,
+            formant_shift_semitones: 0.0,
+            stereo_width_pct: 30.0,
+            loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams { mode: FusionMode::Audition, ..FusionRenderParams::default() },
+        });
+
+        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish a render in time");
+        assert_eq!(output.load().channels.len(), 2, "should still produce a normal stereo render, not panic");
+    }
+
+    #[test]
+    fn worker_uses_source_b_when_present_for_audition_mode() {
+        let sample_rate = 48000.0;
+        let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
+            channels: Vec::new(),
+            sample_rate,
+            root_note: DEFAULT_ROOT_NOTE,
+        })));
+
+        // Sample A and Sample B are different frequencies - Audition mode
+        // must audibly use B, not silently fall back to A.
+        let source_a = make_source(sample_rate, 1.0);
+        let source_b = {
+            let len = (sample_rate * 1.0) as usize;
+            let tone: Vec<f32> = (0..len).map(|i| (i as f32 / sample_rate * 880.0 * std::f32::consts::TAU).sin()).collect();
+            Arc::new(ArcSwap::new(Arc::new(vec![tone])))
+        };
+
+        let trigger_a_only = RenderTrigger::new();
+        let _worker_a_only =
+            RenderWorker::spawn(trigger_a_only.clone(), source_a.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        trigger_a_only.request_render(RenderRequest {
+            freeze_point_pct: 50.0,
+            formant_shift_semitones: 0.0,
+            stereo_width_pct: 0.0,
+            loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams::default(),
+        });
+        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the A-alone render in time");
+        let a_alone = output.load().channels[0].clone();
+
+        output.store(Arc::new(LoopBufferData { channels: Vec::new(), sample_rate, root_note: DEFAULT_ROOT_NOTE }));
+        let trigger_audition = RenderTrigger::new();
+        let _worker_audition =
+            RenderWorker::spawn(trigger_audition.clone(), source_a, source_b, sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        trigger_audition.request_render(RenderRequest {
+            freeze_point_pct: 50.0,
+            formant_shift_semitones: 0.0,
+            stereo_width_pct: 0.0,
+            loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams { mode: FusionMode::Audition, ..FusionRenderParams::default() },
+        });
+        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the Audition render in time");
+        let audition = output.load().channels[0].clone();
+
+        assert_ne!(audition, a_alone, "Audition mode with Sample B loaded should audibly differ from plain Sample A");
     }
 }

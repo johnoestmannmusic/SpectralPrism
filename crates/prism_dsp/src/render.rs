@@ -95,7 +95,6 @@ pub fn render_frozen_loop(
     let num_hops = ((loop_seconds * sample_rate) / HOP_SIZE as f32).round().max(1.0) as usize;
     let out_len = num_hops * HOP_SIZE;
 
-    let formant_ratio = semitones_to_ratio(formant_shift_semitones);
     let width = width_multiplier(stereo_width_pct);
 
     let frozen_left = analyze_freeze_point(source_left, freeze_point_pct, &fft);
@@ -123,38 +122,56 @@ pub fn render_frozen_loop(
         .map(|(k, &p)| p + width * decorrelation_spread(k))
         .collect();
 
-    let render_channel = |mag: Vec<f32>, phase0: Vec<f32>, advance: Vec<f32>| -> Vec<f32> {
-        let mag = if formant_shift_semitones != 0.0 {
-            let env = compute_spectral_envelope(&mag, &fft);
-            let shifted_env = shift_envelope(&env, formant_ratio);
-            reimpose_envelope(&mag, &env, &shifted_env)
-        } else {
-            mag
-        };
+    let left_mag = apply_formant_shift(frozen_left.mag, formant_shift_semitones, &fft);
+    let right_mag = apply_formant_shift(right_mag, formant_shift_semitones, &fft);
 
-        let mut resynth = FreezeResynth::new(mag, phase0, advance, window.clone());
-        let mut accum = vec![0.0f32; out_len];
-        let mut spectrum_scratch = fft.make_spectrum_buffer();
-        let mut time_scratch = fft.make_time_buffer();
-
-        let mut pos = 0usize;
-        while pos < out_len {
-            resynth.next_frame(&fft, &mut spectrum_scratch, &mut time_scratch);
-            ola_accumulate_circular(&mut accum, pos, &time_scratch);
-            pos += HOP_SIZE;
-        }
-
-        accum
-    };
-
-    let left_out = render_channel(frozen_left.mag, frozen_left.phase0, quantized_advance.clone());
-    let right_out = render_channel(right_mag, right_phase0, quantized_advance);
+    let left_out = render_channel(left_mag, frozen_left.phase0, quantized_advance.clone(), &window, &fft, out_len);
+    let right_out = render_channel(right_mag, right_phase0, quantized_advance, &window, &fft, out_len);
 
     LoopBufferData {
         channels: vec![left_out, right_out],
         sample_rate,
         root_note,
     }
+}
+
+/// Reshapes `mag`'s spectral envelope (formants) by `formant_shift_semitones`
+/// while preserving its fine harmonic structure - a no-op when the shift is
+/// zero. Split out of `render_frozen_loop` so the Spectral Fusion combine
+/// path (`fusion.rs`) can apply each source's own formant shift to its own
+/// magnitude independently, before the two sources' spectra are combined.
+pub(crate) fn apply_formant_shift(mag: Vec<f32>, formant_shift_semitones: f32, fft: &FreezeFft) -> Vec<f32> {
+    if formant_shift_semitones == 0.0 {
+        return mag;
+    }
+    let ratio = semitones_to_ratio(formant_shift_semitones);
+    let env = compute_spectral_envelope(&mag, fft);
+    let shifted_env = shift_envelope(&env, ratio);
+    reimpose_envelope(&mag, &env, &shifted_env)
+}
+
+/// Resynthesizes one channel's worth of audio from a (possibly
+/// formant-shifted, possibly fused) frozen spectrum - repeatedly calling
+/// `FreezeResynth::next_frame` and circularly overlap-adding every `HOP_SIZE`
+/// samples until `out_len` samples are produced (see `render_frozen_loop`'s
+/// doc comment for why this makes the loop click-free). Split out of
+/// `render_frozen_loop` so the Spectral Fusion combine path (`fusion.rs`)
+/// can reuse the exact same resynthesis/OLA machinery on a combined spectrum
+/// instead of a single source's.
+pub(crate) fn render_channel(mag: Vec<f32>, phase0: Vec<f32>, advance: Vec<f32>, window: &[f32], fft: &FreezeFft, out_len: usize) -> Vec<f32> {
+    let mut resynth = FreezeResynth::new(mag, phase0, advance, window.to_vec());
+    let mut accum = vec![0.0f32; out_len];
+    let mut spectrum_scratch = fft.make_spectrum_buffer();
+    let mut time_scratch = fft.make_time_buffer();
+
+    let mut pos = 0usize;
+    while pos < out_len {
+        resynth.next_frame(fft, &mut spectrum_scratch, &mut time_scratch);
+        ola_accumulate_circular(&mut accum, pos, &time_scratch);
+        pos += HOP_SIZE;
+    }
+
+    accum
 }
 
 /// Snaps each bin's per-hop phase advance to the nearest value that
@@ -171,7 +188,7 @@ pub fn render_frozen_loop(
 /// loop, which is an inherent, inaudible-in-practice tradeoff of making any
 /// synthesized content loop exactly (this is how every exactly-looping
 /// wavetable/additive synth works).
-fn quantize_advance_for_loop(advance: &[f32], num_hops: usize) -> Vec<f32> {
+pub(crate) fn quantize_advance_for_loop(advance: &[f32], num_hops: usize) -> Vec<f32> {
     let n = num_hops as f32;
     advance
         .iter()

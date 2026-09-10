@@ -1,7 +1,8 @@
 mod render_worker;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use prism_dsp::render::{render_frozen_loop, LoopBufferData, DEFAULT_ROOT_NOTE};
+use prism_dsp::fusion::{render_fused_loop, FusionMode as DspFusionMode, FusionRenderParams};
+use prism_dsp::render::{LoopBufferData, DEFAULT_ROOT_NOTE};
 use prism_dsp::resample::resample_linear;
 use prism_dsp::voice::{AdsrSettings, VoiceManager};
 use nih_plug::prelude::*;
@@ -46,6 +47,14 @@ pub struct PrismPlugin {
     /// is not. Also doubles as the "[ Load Sample ]" sign's gate in
     /// `draw_freeze_point_waveform`.
     loaded_filename: Arc<ArcSwapOption<String>>,
+    /// Sample B, for Spectral Fusion - mirrors `source` exactly, except
+    /// there's no synthetic placeholder tone: it starts genuinely empty
+    /// until the user loads one (see `RenderWorker::spawn`'s "no Sample B
+    /// loaded" guard for what happens if a Fusion mode needing B is
+    /// selected before that).
+    source_b: Arc<ArcSwap<Vec<Vec<f32>>>>,
+    /// Mirrors `loaded_filename` for Sample B.
+    loaded_filename_b: Arc<ArcSwapOption<String>>,
     loop_buffer: Arc<ArcSwap<LoopBufferData>>,
     /// Exists from construction, independent of `worker` (which is only
     /// spawned once `initialize()` runs) - see `RenderWorker::spawn`'s doc
@@ -238,6 +247,123 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+/// Which combination of Sample A's and Sample B's frozen spectra becomes
+/// the plugin's output - see `prism_dsp::fusion` for what each mode
+/// actually does under the hood. This is the automatable, host-visible
+/// mirror of `prism_dsp::fusion::FusionMode` (that one has no nih_plug
+/// dependency by design - see that crate's module doc comment); `to_dsp()`
+/// converts at the render-request boundary (`RenderWorker::spawn`).
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+enum FusionMode {
+    #[id = "off"]
+    #[name = "Off"]
+    Off,
+    #[id = "audition"]
+    #[name = "Audition"]
+    Audition,
+    #[id = "mix"]
+    #[name = "Mix"]
+    Mix,
+    #[id = "cross-synth"]
+    #[name = "Cross-Synth"]
+    CrossSynth,
+    #[id = "convolve"]
+    #[name = "Convolve"]
+    Convolve,
+    #[id = "ring-modulate"]
+    #[name = "Ring Modulate"]
+    RingModulate,
+    #[id = "spectral-max"]
+    #[name = "Spectral Max"]
+    SpectralMax,
+    #[id = "spectral-min"]
+    #[name = "Spectral Min"]
+    SpectralMin,
+    #[id = "cycle"]
+    #[name = "Cycle"]
+    Cycle,
+}
+
+impl Default for FusionMode {
+    fn default() -> Self {
+        FusionMode::Off
+    }
+}
+
+impl FusionMode {
+    fn to_dsp(self) -> DspFusionMode {
+        match self {
+            FusionMode::Off => DspFusionMode::Off,
+            FusionMode::Audition => DspFusionMode::Audition,
+            FusionMode::Mix => DspFusionMode::Mix,
+            FusionMode::CrossSynth => DspFusionMode::CrossSynth,
+            FusionMode::Convolve => DspFusionMode::Convolve,
+            FusionMode::RingModulate => DspFusionMode::RingModulate,
+            FusionMode::SpectralMax => DspFusionMode::SpectralMax,
+            FusionMode::SpectralMin => DspFusionMode::SpectralMin,
+            FusionMode::Cycle => DspFusionMode::Cycle,
+        }
+    }
+
+    /// Every mode except `Off` needs Sample B loaded to sound different from
+    /// plain Sample A - used to show the "load Sample B" warning in the
+    /// editor (the render-worker side of this same guard lives in
+    /// `RenderWorker::spawn`).
+    fn needs_sample_b(self) -> bool {
+        self != FusionMode::Off
+    }
+
+    /// The stable id this mode is saved/restored as in the plugin's own
+    /// preset `.json` files - a string, not the enum itself, so a future
+    /// variant reordering can't silently reinterpret an old preset (mirrors
+    /// nih_plug's own `#[id]`-based automation-safety story for the real
+    /// param). An unrecognized id (a preset from a newer plugin version, or
+    /// a hand-edited file) falls back to `Off` rather than failing to load.
+    fn preset_id(self) -> &'static str {
+        match self {
+            FusionMode::Off => "off",
+            FusionMode::Audition => "audition",
+            FusionMode::Mix => "mix",
+            FusionMode::CrossSynth => "cross-synth",
+            FusionMode::Convolve => "convolve",
+            FusionMode::RingModulate => "ring-modulate",
+            FusionMode::SpectralMax => "spectral-max",
+            FusionMode::SpectralMin => "spectral-min",
+            FusionMode::Cycle => "cycle",
+        }
+    }
+
+    fn from_preset_id(id: &str) -> Self {
+        match id {
+            "audition" => FusionMode::Audition,
+            "mix" => FusionMode::Mix,
+            "cross-synth" => FusionMode::CrossSynth,
+            "convolve" => FusionMode::Convolve,
+            "ring-modulate" => FusionMode::RingModulate,
+            "spectral-max" => FusionMode::SpectralMax,
+            "spectral-min" => FusionMode::SpectralMin,
+            "cycle" => FusionMode::Cycle,
+            _ => FusionMode::Off,
+        }
+    }
+
+    /// Two teaching-oriented sentences describing the currently selected
+    /// algorithm, shown in the editor's info box underneath Sample B.
+    fn info_text(self) -> &'static str {
+        match self {
+            FusionMode::Off => "Only Sample A's frozen snapshot plays. A Freeze Point captures a single spectral instant of a sample and loops it forever, which is the whole idea behind SpectralPrism.",
+            FusionMode::Audition => "Only Sample B's frozen snapshot plays, and Sample A is ignored entirely. Useful for previewing what Sample B sounds like frozen on its own before blending it in.",
+            FusionMode::Mix => "A's and B's independently frozen loops are crossfaded together using the Mix Blend slider. At 0% you hear pure A, at 100% pure B, and in between a simple volume blend of both.",
+            FusionMode::CrossSynth => "B's overall spectral shape (formants) is imposed onto A's fine detail and phase, so A keeps its texture but takes on B's tonal color. The Amount slider fades this reshaping in from A's own shape (0%) to B's shape (100%).",
+            FusionMode::Convolve => "A's and B's frozen spectra are multiplied together bin by bin, which is how audio convolution works in the frequency domain. This tends to produce dense, resonant, often unpredictable new timbres, dialed in with the Amount slider.",
+            FusionMode::RingModulate => "A's and B's resynthesized loops are multiplied together sample by sample, the classic ring-modulation technique. This creates metallic, bell-like inharmonic tones, blended against plain A with the Amount slider.",
+            FusionMode::SpectralMax => "At every frequency bin, whichever of A or B is louder there wins and is used in the output. The result favors each source's strongest frequencies, often sounding brighter or more aggressive than either alone.",
+            FusionMode::SpectralMin => "At every frequency bin, whichever of A or B is quieter there wins and is used in the output. The result keeps only what both sources have in common, often sounding darker or thinner than either alone.",
+            FusionMode::Cycle => "One full loop of A's frozen sound plays, then one full loop of B's, then it repeats - an alternating pattern rather than a blend. Good for rhythmic back-and-forth textures instead of a simultaneous combination.",
+        }
+    }
+}
+
 #[derive(Params)]
 struct PrismPluginParams {
     #[persist = "editor-state"]
@@ -266,6 +392,13 @@ struct PrismPluginParams {
     #[persist = "selected-preset"]
     selected_preset: Mutex<Option<String>>,
 
+    /// Sample B's loaded file path, if any - mirrors `sample_path` above for
+    /// the same reason (survives a host project save/reload and preset
+    /// recall). `None` until the user loads a Sample B; unlike `sample_path`
+    /// there's no synthetic placeholder to fall back to.
+    #[persist = "sample-path-b"]
+    sample_path_b: Mutex<Option<PathBuf>>,
+
     #[id = "freeze_point"]
     pub freeze_point: FloatParam,
 
@@ -274,6 +407,39 @@ struct PrismPluginParams {
 
     #[id = "stereo_width"]
     pub stereo_width: FloatParam,
+
+    /// Which Spectral Fusion algorithm combines Sample A's and Sample B's
+    /// frozen spectra - see `FusionMode`/`prism_dsp::fusion`.
+    #[id = "fusion_mode"]
+    pub fusion_mode: EnumParam<FusionMode>,
+
+    /// Sample B's own Freeze Point, independent of Sample A's - only
+    /// meaningful once `fusion_mode` is anything but `Off`.
+    #[id = "freeze_point_b"]
+    pub freeze_point_b: FloatParam,
+
+    /// Sample B's own Formant Shift, independent of Sample A's.
+    #[id = "formant_shift_b"]
+    pub formant_shift_b: FloatParam,
+
+    /// Mix mode's A/B blend: 0% is plain A, 100% is plain B.
+    #[id = "fusion_mix_amount"]
+    pub fusion_mix_amount: FloatParam,
+
+    /// Cross-Synth mode's dry/wet amount: 0% is plain A, 100% is B's
+    /// spectral envelope fully imposed.
+    #[id = "fusion_cross_synth_amount"]
+    pub fusion_cross_synth_amount: FloatParam,
+
+    /// Convolve mode's dry/wet amount: 0% is plain A, 100% is the full
+    /// per-bin complex product of A's and B's spectra.
+    #[id = "fusion_convolve_amount"]
+    pub fusion_convolve_amount: FloatParam,
+
+    /// Ring Modulate mode's dry/wet amount: 0% is plain A, 100% is the full
+    /// (peak-normalized) sample-by-sample product of A's and B's loops.
+    #[id = "fusion_ring_mod_amount"]
+    pub fusion_ring_mod_amount: FloatParam,
 
     /// Length of the frozen loop buffer itself (not the FreezeFft/playback
     /// duration) - shorter values reduce both the in-memory buffer size and
@@ -322,6 +488,8 @@ impl Default for PrismPlugin {
             params: Arc::new(PrismPluginParams::default()),
             source: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
             loaded_filename: Arc::new(ArcSwapOption::from(None)),
+            source_b: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
+            loaded_filename_b: Arc::new(ArcSwapOption::from(None)),
             loop_buffer: Arc::new(ArcSwap::new(Arc::new(silent_loop_buffer()))),
             trigger: RenderTrigger::new(),
             worker: None,
@@ -333,6 +501,7 @@ impl Default for PrismPlugin {
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 30.0,
                 loop_length_seconds: prism_dsp::render::DEFAULT_LOOP_SECONDS,
+                fusion: FusionRenderParams::default(),
             },
             pending_request: None,
             throttle_countdown: 0,
@@ -351,6 +520,7 @@ impl Default for PrismPluginParams {
             ),
             sample_path: Mutex::new(None),
             selected_preset: Mutex::new(None),
+            sample_path_b: Mutex::new(None),
             freeze_point: FloatParam::new("Freeze Point", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
             formant_shift: FloatParam::new(
@@ -360,6 +530,24 @@ impl Default for PrismPluginParams {
             )
             .with_unit(" st"),
             stereo_width: FloatParam::new("Stereo Width", 30.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            fusion_mode: EnumParam::new("Spectral Fusion", FusionMode::Off),
+            freeze_point_b: FloatParam::new("Freeze Point B", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            formant_shift_b: FloatParam::new("Formant Shift B", 0.0, FloatRange::Linear { min: -12.0, max: 12.0 })
+                .with_unit(" st"),
+            // A blend slider, not an intensity dial - 50/50 is the honest
+            // "on" starting point.
+            fusion_mix_amount: FloatParam::new("Mix Blend", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            // Intensity dials on an already-deliberately-chosen effect -
+            // selecting the mode itself communicates intent, so full-wet is
+            // the sensible starting point.
+            fusion_cross_synth_amount: FloatParam::new("Cross-Synth Amount", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            fusion_convolve_amount: FloatParam::new("Convolve Amount", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            fusion_ring_mod_amount: FloatParam::new("Ring Mod Amount", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
             loop_length_seconds: FloatParam::new(
                 "Loop Length",
@@ -490,17 +678,44 @@ fn load_and_prepare_sample(path: &Path, plugin_rate: f32) -> Result<Vec<Vec<f32>
     Ok(prepare_source_for_plugin_rate(channels, file_rate, plugin_rate))
 }
 
+/// Every DSP-relevant param bundled into one `RenderRequest`, including the
+/// current Spectral Fusion settings - shared by every call site that needs
+/// to (re-)request a render (`load_sample_from_path`, `initialize()`,
+/// `process()`) so this growing field list only needs to be assembled in
+/// one place.
+fn current_render_request(params: &PrismPluginParams) -> RenderRequest {
+    RenderRequest {
+        freeze_point_pct: params.freeze_point.value(),
+        formant_shift_semitones: params.formant_shift.value(),
+        stereo_width_pct: params.stereo_width.value(),
+        loop_length_seconds: params.loop_length_seconds.value(),
+        fusion: FusionRenderParams {
+            mode: params.fusion_mode.value().to_dsp(),
+            freeze_point_b_pct: params.freeze_point_b.value(),
+            formant_shift_b_semitones: params.formant_shift_b.value(),
+            mix_amount_pct: params.fusion_mix_amount.value(),
+            cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
+            convolve_amount_pct: params.fusion_convolve_amount.value(),
+            ring_mod_amount_pct: params.fusion_ring_mod_amount.value(),
+        },
+    }
+}
+
 /// The full "a real file has just been chosen" flow, shared by the
-/// interactive file dialog (`open_sample_dialog`) and preset recall
-/// (`apply_preset`, when a preset references a sample): decode/resample it,
-/// swap it into `source`, persist the path (`PrismPluginParams::
-/// sample_path`, see its doc comment) so it survives a host project
-/// save/reload, trigger a re-render at the current Freeze Point/Formant
-/// Shift/Stereo Width, and update `loaded_filename` plus any editor error
-/// message.
+/// interactive file dialogs (`open_sample_dialog`/`open_sample_dialog_b`)
+/// and preset recall (`apply_preset`, when a preset references a sample):
+/// decode/resample it, swap it into `source`, persist the path into
+/// `sample_path_slot` (`PrismPluginParams::sample_path` for Sample A,
+/// `::sample_path_b` for Sample B - see either field's doc comment) so it
+/// survives a host project save/reload, trigger a re-render at every
+/// current param (including the other sample slot's, untouched), and
+/// update `loaded_filename` plus any editor error message. Takes the
+/// source/path-slot/filename-handle explicitly (rather than hardcoding
+/// Sample A's) so both slots share this one flow instead of duplicating it.
 fn load_sample_from_path(
     path: &Path,
     source: &Arc<ArcSwap<Vec<Vec<f32>>>>,
+    sample_path_slot: &Mutex<Option<PathBuf>>,
     loop_buffer: &Arc<ArcSwap<LoopBufferData>>,
     trigger: &RenderTrigger,
     params: &PrismPluginParams,
@@ -510,13 +725,8 @@ fn load_sample_from_path(
     match load_and_prepare_sample(path, loop_buffer.load().sample_rate) {
         Ok(prepared) => {
             source.store(Arc::new(prepared));
-            *params.sample_path.lock().unwrap() = Some(path.to_path_buf());
-            trigger.request_render(RenderRequest {
-                freeze_point_pct: params.freeze_point.value(),
-                formant_shift_semitones: params.formant_shift.value(),
-                stereo_width_pct: params.stereo_width.value(),
-                loop_length_seconds: params.loop_length_seconds.value(),
-            });
+            *sample_path_slot.lock().unwrap() = Some(path.to_path_buf());
+            trigger.request_render(current_render_request(params));
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
             loaded_filename.store(name.map(Arc::new));
             state.error = None;
@@ -602,10 +812,60 @@ struct Preset {
     /// applied to anything, and never blocks an import.
     #[serde(default)]
     build_number: String,
+    /// A stable id string (`FusionMode::preset_id`/`from_preset_id`), not
+    /// the enum itself - a future variant reordering can't silently
+    /// reinterpret an old preset. `#[serde(default)]` (an empty string,
+    /// which `from_preset_id` treats the same as `"off"`) for presets saved
+    /// before Spectral Fusion existed.
+    #[serde(default)]
+    fusion_mode: String,
+    /// `#[serde(default = "default_freeze_point_b_pct")]`, matching
+    /// `freeze_point_b`'s own `FloatParam` default (50.0) - unlike
+    /// `formant_shift_b_semitones` below, 0.0 would put Sample B's Freeze
+    /// Point at the very start of the sample, which isn't a neutral/no-op
+    /// value the way 0.0 is for a shift or a percentage blend.
+    #[serde(default = "default_freeze_point_b_pct")]
+    freeze_point_b_pct: f32,
+    #[serde(default)]
+    formant_shift_b_semitones: f32,
+    /// `#[serde(default = "default_fusion_mix_amount_pct")]`: Mix is a
+    /// blend slider, not an intensity dial, so its neutral default is 50%
+    /// (matching `fusion_mix_amount`'s own `FloatParam` default), not 0.0.
+    #[serde(default = "default_fusion_mix_amount_pct")]
+    fusion_mix_amount_pct: f32,
+    /// `#[serde(default = "default_fusion_full_amount_pct")]` on these
+    /// three: intensity dials on an already-deliberately-chosen effect, so
+    /// their neutral default is 100% (full amount), matching each control's
+    /// own `FloatParam` default - not 0.0, which would silently mean "no
+    /// effect" for a preset that predates these controls but still had a
+    /// Fusion mode selected (impossible today, but keeps the invariant that
+    /// a preset missing a field behaves like a freshly-created instance).
+    #[serde(default = "default_fusion_full_amount_pct")]
+    fusion_cross_synth_amount_pct: f32,
+    #[serde(default = "default_fusion_full_amount_pct")]
+    fusion_convolve_amount_pct: f32,
+    #[serde(default = "default_fusion_full_amount_pct")]
+    fusion_ring_mod_amount_pct: f32,
+    /// Mirrors `sample_path` for Sample B - `None` if no Sample B was ever
+    /// loaded when this preset was saved.
+    #[serde(default)]
+    sample_path_b: Option<PathBuf>,
 }
 
 fn default_loop_length_seconds() -> f32 {
     prism_dsp::render::DEFAULT_LOOP_SECONDS
+}
+
+fn default_freeze_point_b_pct() -> f32 {
+    50.0
+}
+
+fn default_fusion_mix_amount_pct() -> f32 {
+    50.0
+}
+
+fn default_fusion_full_amount_pct() -> f32 {
+    100.0
 }
 
 impl Preset {
@@ -625,6 +885,14 @@ impl Preset {
             pan_width_pct: params.pan_width_pct.value(),
             sample_path: params.sample_path.lock().unwrap().clone(),
             build_number: BUILD_NUMBER.to_string(),
+            fusion_mode: params.fusion_mode.value().preset_id().to_string(),
+            freeze_point_b_pct: params.freeze_point_b.value(),
+            formant_shift_b_semitones: params.formant_shift_b.value(),
+            fusion_mix_amount_pct: params.fusion_mix_amount.value(),
+            fusion_cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
+            fusion_convolve_amount_pct: params.fusion_convolve_amount.value(),
+            fusion_ring_mod_amount_pct: params.fusion_ring_mod_amount.value(),
+            sample_path_b: params.sample_path_b.lock().unwrap().clone(),
         }
     }
 }
@@ -981,11 +1249,13 @@ impl Plugin for PrismPlugin {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let source = self.source.clone();
+        let source_b = self.source_b.clone();
         let loop_buffer = self.loop_buffer.clone();
         let trigger = self.trigger.clone();
         let last_note = self.last_note.clone();
         let active_voice_count = self.active_voice_count.clone();
         let loaded_filename = self.loaded_filename.clone();
+        let loaded_filename_b = self.loaded_filename_b.clone();
 
         create_egui_editor(
             self.params.editor_state.clone(),
@@ -1016,8 +1286,45 @@ impl Plugin for PrismPlugin {
                 // same file dialog / decode / re-render flow.
                 let open_sample_dialog = |state: &mut PrismEditorState| {
                     if let Some(path) = rfd::FileDialog::new().add_filter("WAV", &["wav", "WAV"]).pick_file() {
-                        load_sample_from_path(&path, &source, &loop_buffer, &trigger, &params, &loaded_filename, state);
+                        load_sample_from_path(&path, &source, &params.sample_path, &loop_buffer, &trigger, &params, &loaded_filename, state);
                     }
+                };
+                // Sample B's counterpart, for Spectral Fusion - same flow,
+                // its own source/path-slot/filename handle.
+                let open_sample_dialog_b = |state: &mut PrismEditorState| {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("WAV", &["wav", "WAV"]).pick_file() {
+                        load_sample_from_path(&path, &source_b, &params.sample_path_b, &loop_buffer, &trigger, &params, &loaded_filename_b, state);
+                    }
+                };
+
+                // Shared by `apply_preset` for both Sample A and Sample B:
+                // loads `path_opt` if it's `Some`, and if that fails,
+                // prompts the user to locate the moved/missing file - see
+                // `apply_preset`'s own doc comment for why a preset stores
+                // (and may need to re-resolve) an absolute sample path.
+                let load_or_relocate = |path_opt: &Option<PathBuf>,
+                                        source: &Arc<ArcSwap<Vec<Vec<f32>>>>,
+                                        sample_path_slot: &Mutex<Option<PathBuf>>,
+                                        loaded_filename: &Arc<ArcSwapOption<String>>,
+                                        label: &str,
+                                        state: &mut PrismEditorState|
+                 -> Option<PathBuf> {
+                    let path = path_opt.as_ref()?;
+                    load_sample_from_path(path, source, sample_path_slot, &loop_buffer, &trigger, &params, loaded_filename, state);
+                    if state.error.is_none() {
+                        return None;
+                    }
+
+                    rfd::MessageDialog::new()
+                        .set_title("Sample not found")
+                        .set_description(format!(
+                            "{label}'s sample couldn't be found:\n{}\n\nLocate it to continue.",
+                            path.display()
+                        ))
+                        .show();
+                    let relocated = rfd::FileDialog::new().add_filter("WAV", &["wav", "WAV"]).pick_file()?;
+                    load_sample_from_path(&relocated, source, sample_path_slot, &loop_buffer, &trigger, &params, loaded_filename, state);
+                    state.error.is_none().then_some(relocated)
                 };
 
                 // Recalls a saved snapshot: every DSP param via the same
@@ -1039,7 +1346,7 @@ impl Plugin for PrismPlugin {
                 // returned here so the caller can write it back into
                 // whichever preset file this came from, so it doesn't have
                 // to be re-located every time on this machine specifically.
-                let apply_preset = |preset: &Preset, state: &mut PrismEditorState| -> Option<PathBuf> {
+                let apply_preset = |preset: &Preset, state: &mut PrismEditorState| -> (Option<PathBuf>, Option<PathBuf>) {
                     let set = |param: &FloatParam, value: f32| {
                         setter.begin_set_parameter(param);
                         setter.set_parameter(param, value);
@@ -1057,23 +1364,26 @@ impl Plugin for PrismPlugin {
                     set(&params.pitch_bend_range_semitones, preset.pitch_bend_range_semitones);
                     set(&params.pan_center_pct, preset.pan_center_pct);
                     set(&params.pan_width_pct, preset.pan_width_pct);
+                    set(&params.freeze_point_b, preset.freeze_point_b_pct);
+                    set(&params.formant_shift_b, preset.formant_shift_b_semitones);
+                    set(&params.fusion_mix_amount, preset.fusion_mix_amount_pct);
+                    set(&params.fusion_cross_synth_amount, preset.fusion_cross_synth_amount_pct);
+                    set(&params.fusion_convolve_amount, preset.fusion_convolve_amount_pct);
+                    set(&params.fusion_ring_mod_amount, preset.fusion_ring_mod_amount_pct);
+                    setter.begin_set_parameter(&params.fusion_mode);
+                    setter.set_parameter(&params.fusion_mode, FusionMode::from_preset_id(&preset.fusion_mode));
+                    setter.end_set_parameter(&params.fusion_mode);
 
-                    let Some(path) = &preset.sample_path else { return None };
-                    load_sample_from_path(path, &source, &loop_buffer, &trigger, &params, &loaded_filename, state);
-                    if state.error.is_none() {
-                        return None;
-                    }
-
-                    rfd::MessageDialog::new()
-                        .set_title("Sample not found")
-                        .set_description(format!(
-                            "This preset's sample couldn't be found:\n{}\n\nLocate it to continue.",
-                            path.display()
-                        ))
-                        .show();
-                    let relocated = rfd::FileDialog::new().add_filter("WAV", &["wav", "WAV"]).pick_file()?;
-                    load_sample_from_path(&relocated, &source, &loop_buffer, &trigger, &params, &loaded_filename, state);
-                    state.error.is_none().then_some(relocated)
+                    // Sample A's own relocate error takes priority over
+                    // Sample B's (or its absence) if both need attention -
+                    // whichever ran last would otherwise silently overwrite
+                    // `state.error`, see `load_or_relocate`.
+                    let relocated_a = load_or_relocate(&preset.sample_path, &source, &params.sample_path, &loaded_filename, "Sample A", state);
+                    let error_after_a = state.error.take();
+                    let relocated_b =
+                        load_or_relocate(&preset.sample_path_b, &source_b, &params.sample_path_b, &loaded_filename_b, "Sample B", state);
+                    state.error = error_after_a.or(state.error.take());
+                    (relocated_a, relocated_b)
                 };
 
                 // A persistent bottom strip, added *before* the central
@@ -1118,8 +1428,14 @@ impl Plugin for PrismPlugin {
                                     // in the right final state (set if the
                                     // sample couldn't be found/relocated,
                                     // cleared otherwise) - not overwritten here.
-                                    if let Some(relocated) = apply_preset(&preset, state) {
-                                        preset.sample_path = Some(relocated);
+                                    let (relocated_a, relocated_b) = apply_preset(&preset, state);
+                                    if relocated_a.is_some() || relocated_b.is_some() {
+                                        if let Some(relocated) = relocated_a {
+                                            preset.sample_path = Some(relocated);
+                                        }
+                                        if let Some(relocated) = relocated_b {
+                                            preset.sample_path_b = Some(relocated);
+                                        }
                                         // Best-effort: a failed resave isn't
                                         // worth surfacing as an error - the
                                         // preset still applied correctly this
@@ -1195,8 +1511,14 @@ impl Plugin for PrismPlugin {
                                         Ok(mut preset) => {
                                             // See `load_preset_at` for why
                                             // `state.error` isn't touched here.
-                                            if let Some(relocated) = apply_preset(&preset, state) {
-                                                preset.sample_path = Some(relocated);
+                                            let (relocated_a, relocated_b) = apply_preset(&preset, state);
+                                            if relocated_a.is_some() || relocated_b.is_some() {
+                                                if let Some(relocated) = relocated_a {
+                                                    preset.sample_path = Some(relocated);
+                                                }
+                                                if let Some(relocated) = relocated_b {
+                                                    preset.sample_path_b = Some(relocated);
+                                                }
                                                 let _ = write_preset_file(&path, &preset);
                                             }
                                             let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -1257,11 +1579,68 @@ impl Plugin for PrismPlugin {
                             left.label("Formant Shift");
                             left.add(widgets::ParamSlider::for_param(&params.formant_shift, setter));
 
-                            left.label("Stereo Width");
-                            left.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
+                            left.add_space(8.0);
+                            left.label("Spectral Fusion");
+                            let current_fusion = params.fusion_mode.value();
+                            egui::ComboBox::from_id_salt("spectral_prism_fusion_combo")
+                                .selected_text(FusionMode::variants()[current_fusion.to_index()])
+                                .show_ui(left, |ui| {
+                                    for idx in 0..FusionMode::variants().len() {
+                                        let variant = FusionMode::from_index(idx);
+                                        if ui.selectable_label(current_fusion == variant, FusionMode::variants()[idx]).clicked() {
+                                            setter.begin_set_parameter(&params.fusion_mode);
+                                            setter.set_parameter(&params.fusion_mode, variant);
+                                            setter.end_set_parameter(&params.fusion_mode);
+                                        }
+                                    }
+                                });
 
-                            left.label("Loop Length");
-                            left.add(widgets::ParamSlider::for_param(&params.loop_length_seconds, setter));
+                            if current_fusion != FusionMode::Off {
+                                left.add_space(8.0);
+                                left.label("Sample B \u{2014} Freeze Point");
+                                let has_loaded_sample_b = loaded_filename_b.load().is_some();
+                                if draw_freeze_point_waveform(left, &source_b, &params.freeze_point_b, setter, has_loaded_sample_b, scale) {
+                                    open_sample_dialog_b(state);
+                                }
+                                left.add(widgets::ParamSlider::for_param(&params.freeze_point_b, setter));
+
+                                left.label("Sample B \u{2014} Formant Shift");
+                                left.add(widgets::ParamSlider::for_param(&params.formant_shift_b, setter));
+
+                                match current_fusion {
+                                    FusionMode::Mix => {
+                                        left.label("Mix Blend (A \u{2194} B)");
+                                        left.add(widgets::ParamSlider::for_param(&params.fusion_mix_amount, setter));
+                                    }
+                                    FusionMode::CrossSynth => {
+                                        left.label("Cross-Synth Amount");
+                                        left.add(widgets::ParamSlider::for_param(&params.fusion_cross_synth_amount, setter));
+                                    }
+                                    FusionMode::Convolve => {
+                                        left.label("Convolve Amount");
+                                        left.add(widgets::ParamSlider::for_param(&params.fusion_convolve_amount, setter));
+                                    }
+                                    FusionMode::RingModulate => {
+                                        left.label("Ring Mod Amount");
+                                        left.add(widgets::ParamSlider::for_param(&params.fusion_ring_mod_amount, setter));
+                                    }
+                                    _ => {}
+                                }
+
+                                if !has_loaded_sample_b && current_fusion.needs_sample_b() {
+                                    left.add_space(4.0);
+                                    left.colored_label(COLOR_ERROR, "This mode needs Sample B - load one above to hear it.");
+                                }
+
+                                left.add_space(8.0);
+                                egui::Frame::default()
+                                    .fill(COLOR_SURFACE_DEEP)
+                                    .stroke(egui::Stroke::new(1.0, COLOR_EDGE))
+                                    .inner_margin(egui::Margin::same((6.0 * scale) as i8))
+                                    .show(left, |ui| {
+                                        ui.colored_label(COLOR_DIM, current_fusion.info_text());
+                                    });
+                            }
 
                             let right = &mut columns[1];
                             right.label("Envelope (Attack / Decay / Sustain / Release)");
@@ -1278,6 +1657,13 @@ impl Plugin for PrismPlugin {
                             right.add_space(8.0);
                             right.label("Velocity Sensitivity");
                             right.add(widgets::ParamSlider::for_param(&params.velocity_sensitivity, setter));
+
+                            right.add_space(8.0);
+                            right.label("Stereo Width");
+                            right.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
+
+                            right.label("Loop Length");
+                            right.add(widgets::ParamSlider::for_param(&params.loop_length_seconds, setter));
 
                             right.add_space(8.0);
                             right.label("Pitch Bend Range");
@@ -1363,20 +1749,40 @@ impl Plugin for PrismPlugin {
             }
         }
 
-        let request = RenderRequest {
-            freeze_point_pct: self.params.freeze_point.value(),
-            formant_shift_semitones: self.params.formant_shift.value(),
-            stereo_width_pct: self.params.stereo_width.value(),
-            loop_length_seconds: self.params.loop_length_seconds.value(),
-        };
+        // Sample B mirrors Sample A's restore above, except there's no
+        // synthetic placeholder to fall back to - a missing/moved file (or
+        // simply never having loaded one) just leaves `source_b` empty,
+        // which `prism_dsp::fusion::effective_mode` (used below and by
+        // `RenderWorker`) already treats as "Fusion mode needs B but none is
+        // loaded" and degrades gracefully rather than failing.
+        let restored_path_b = self.params.sample_path_b.lock().unwrap().clone();
+        match restored_path_b.as_deref().map(|path| (path, load_and_prepare_sample(path, sample_rate))) {
+            Some((path, Ok(prepared))) => {
+                self.source_b.store(Arc::new(prepared));
+                self.loaded_filename_b.store(path.file_name().map(|n| Arc::new(n.to_string_lossy().into_owned())));
+            }
+            Some((path, Err(e))) => {
+                nih_log!("SpectralPrism: couldn't restore Sample B from {}: {e}", path.display());
+                self.loaded_filename_b.store(None);
+            }
+            None => {
+                self.loaded_filename_b.store(None);
+            }
+        }
+
+        let request = current_render_request(&self.params);
         // First render happens synchronously here (initialize() runs before
         // playback starts, so blocking is fine) so process() never sees the
         // placeholder silent buffer once the host actually starts playing.
-        self.loop_buffer.store(Arc::new(render_frozen_loop(
+        let effective_fusion =
+            FusionRenderParams { mode: prism_dsp::fusion::effective_mode(request.fusion.mode, &self.source_b.load()), ..request.fusion };
+        self.loop_buffer.store(Arc::new(render_fused_loop(
             &self.source.load(),
+            &self.source_b.load(),
             sample_rate,
             request.freeze_point_pct,
             request.formant_shift_semitones,
+            &effective_fusion,
             request.stereo_width_pct,
             request.loop_length_seconds,
             DEFAULT_ROOT_NOTE,
@@ -1386,6 +1792,7 @@ impl Plugin for PrismPlugin {
         self.worker = Some(RenderWorker::spawn(
             self.trigger.clone(),
             self.source.clone(),
+            self.source_b.clone(),
             sample_rate,
             DEFAULT_ROOT_NOTE,
             self.loop_buffer.clone(),
@@ -1415,12 +1822,7 @@ impl Plugin for PrismPlugin {
         // once every RENDER_THROTTLE_MS, so a smooth drag/automation sweep
         // can't land a new buffer swap before the previous one's crossfade
         // has finished (see RENDER_THROTTLE_MS for why that matters).
-        let current_request = RenderRequest {
-            freeze_point_pct: self.params.freeze_point.value(),
-            formant_shift_semitones: self.params.formant_shift.value(),
-            stereo_width_pct: self.params.stereo_width.value(),
-            loop_length_seconds: self.params.loop_length_seconds.value(),
-        };
+        let current_request = current_render_request(&self.params);
         if current_request != self.last_requested {
             self.pending_request = Some(current_request);
         }
@@ -1553,6 +1955,14 @@ mod preset_tests {
             pan_width_pct: 35.0,
             sample_path,
             build_number: "20260101".to_string(),
+            fusion_mode: "cross-synth".to_string(),
+            freeze_point_b_pct: 65.0,
+            formant_shift_b_semitones: 1.5,
+            fusion_mix_amount_pct: 30.0,
+            fusion_cross_synth_amount_pct: 80.0,
+            fusion_convolve_amount_pct: 90.0,
+            fusion_ring_mod_amount_pct: 70.0,
+            sample_path_b: Some(PathBuf::from("/some/sample-b.wav")),
         }
     }
 
@@ -1576,6 +1986,44 @@ mod preset_tests {
         assert_eq!(restored.pan_width_pct, original.pan_width_pct);
         assert_eq!(restored.sample_path, original.sample_path);
         assert_eq!(restored.build_number, original.build_number);
+        assert_eq!(restored.fusion_mode, original.fusion_mode);
+        assert_eq!(restored.freeze_point_b_pct, original.freeze_point_b_pct);
+        assert_eq!(restored.formant_shift_b_semitones, original.formant_shift_b_semitones);
+        assert_eq!(restored.fusion_mix_amount_pct, original.fusion_mix_amount_pct);
+        assert_eq!(restored.fusion_cross_synth_amount_pct, original.fusion_cross_synth_amount_pct);
+        assert_eq!(restored.fusion_convolve_amount_pct, original.fusion_convolve_amount_pct);
+        assert_eq!(restored.fusion_ring_mod_amount_pct, original.fusion_ring_mod_amount_pct);
+        assert_eq!(restored.sample_path_b, original.sample_path_b);
+    }
+
+    #[test]
+    fn preset_without_fusion_fields_still_deserializes() {
+        // Regression test for backward compatibility: a preset saved before
+        // Spectral Fusion existed must still load, defaulting to Fusion off
+        // and every new control at the same default its `FloatParam`/
+        // `EnumParam` counterpart has for a freshly-created instance (see
+        // each field's own `#[serde(default = "...")]` doc comment).
+        let old_json = r#"{
+            "freeze_point_pct": 42.0,
+            "formant_shift_semitones": -3.5,
+            "stereo_width_pct": 60.0,
+            "attack_ms": 12.0,
+            "decay_ms": 250.0,
+            "sustain_pct": 70.0,
+            "release_ms": 500.0,
+            "velocity_sensitivity_pct": 80.0,
+            "sample_path": null
+        }"#;
+        let restored: Preset = serde_json::from_str(old_json).expect("old-format preset should still deserialize");
+        assert_eq!(restored.fusion_mode, "");
+        assert_eq!(FusionMode::from_preset_id(&restored.fusion_mode), FusionMode::Off);
+        assert_eq!(restored.freeze_point_b_pct, 50.0);
+        assert_eq!(restored.formant_shift_b_semitones, 0.0);
+        assert_eq!(restored.fusion_mix_amount_pct, 50.0);
+        assert_eq!(restored.fusion_cross_synth_amount_pct, 100.0);
+        assert_eq!(restored.fusion_convolve_amount_pct, 100.0);
+        assert_eq!(restored.fusion_ring_mod_amount_pct, 100.0);
+        assert_eq!(restored.sample_path_b, None);
     }
 
     #[test]
