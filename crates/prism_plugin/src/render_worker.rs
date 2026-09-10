@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 #[derive(Clone, Copy, PartialEq)]
 pub struct RenderRequest {
     pub freeze_point_pct: f32,
+    pub volume_pct: f32,
     pub formant_shift_semitones: f32,
     pub stereo_width_pct: f32,
     pub loop_length_seconds: f32,
@@ -122,6 +123,7 @@ impl RenderWorker {
                     &current_source_b,
                     sample_rate,
                     request.freeze_point_pct,
+                    request.volume_pct,
                     request.formant_shift_semitones,
                     &effective_fusion,
                     request.stereo_width_pct,
@@ -194,6 +196,7 @@ mod tests {
             RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -219,6 +222,7 @@ mod tests {
         let trigger = RenderTrigger::new();
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -253,6 +257,7 @@ mod tests {
         for freeze_point_pct in [10.0, 20.0, 30.0, 40.0, 50.0] {
             trigger.request_render(RenderRequest {
                 freeze_point_pct,
+                volume_pct: 100.0,
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 0.0,
                 loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -285,6 +290,7 @@ mod tests {
         let _worker = RenderWorker::spawn(trigger.clone(), source.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         let request = RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -332,6 +338,7 @@ mod tests {
         // empty source.
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -365,6 +372,7 @@ mod tests {
             RenderWorker::spawn(trigger_a_only.clone(), source_a.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger_a_only.request_render(RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -379,6 +387,7 @@ mod tests {
             RenderWorker::spawn(trigger_audition.clone(), source_a, source_b, sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger_audition.request_render(RenderRequest {
             freeze_point_pct: 50.0,
+            volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,

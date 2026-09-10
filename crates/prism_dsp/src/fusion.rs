@@ -74,12 +74,17 @@ impl FusionMode {
 }
 
 /// Every Fusion-related render parameter bundled together, mirroring
-/// `render_worker::RenderRequest`'s flat style one level down.
+/// `render_worker::RenderRequest`'s flat style one level down. Sample A's
+/// own volume (`volume_a_pct`) lives alongside `freeze_point_a_pct`/
+/// `formant_shift_a_semitones` as a top-level `render_fused_loop` argument
+/// instead of in here, mirroring how those two are already split from the
+/// Sample-B-specific fields below.
 #[derive(Clone, Copy, PartialEq)]
 pub struct FusionRenderParams {
     pub mode: FusionMode,
     pub freeze_point_b_pct: f32,
     pub formant_shift_b_semitones: f32,
+    pub volume_b_pct: f32,
     pub mix_amount_pct: f32,
     pub cross_synth_amount_pct: f32,
     pub convolve_amount_pct: f32,
@@ -109,6 +114,7 @@ impl Default for FusionRenderParams {
             mode: FusionMode::Off,
             freeze_point_b_pct: 50.0,
             formant_shift_b_semitones: 0.0,
+            volume_b_pct: 100.0,
             mix_amount_pct: 50.0,
             cross_synth_amount_pct: 100.0,
             convolve_amount_pct: 100.0,
@@ -126,6 +132,7 @@ pub fn render_fused_loop(
     source_b: &[Vec<f32>],
     sample_rate: f32,
     freeze_point_a_pct: f32,
+    volume_a_pct: f32,
     formant_shift_a_semitones: f32,
     fusion: &FusionRenderParams,
     stereo_width_pct: f32,
@@ -133,9 +140,31 @@ pub fn render_fused_loop(
     root_note: u8,
 ) -> LoopBufferData {
     if fusion.mode.is_pre_resynth() {
-        render_pre_resynth_fusion(source_a, source_b, sample_rate, freeze_point_a_pct, formant_shift_a_semitones, fusion, stereo_width_pct, loop_length_seconds, root_note)
+        render_pre_resynth_fusion(
+            source_a,
+            source_b,
+            sample_rate,
+            freeze_point_a_pct,
+            volume_a_pct,
+            formant_shift_a_semitones,
+            fusion,
+            stereo_width_pct,
+            loop_length_seconds,
+            root_note,
+        )
     } else {
-        render_post_resynth_fusion(source_a, source_b, sample_rate, freeze_point_a_pct, formant_shift_a_semitones, fusion, stereo_width_pct, loop_length_seconds, root_note)
+        render_post_resynth_fusion(
+            source_a,
+            source_b,
+            sample_rate,
+            freeze_point_a_pct,
+            volume_a_pct,
+            formant_shift_a_semitones,
+            fusion,
+            stereo_width_pct,
+            loop_length_seconds,
+            root_note,
+        )
     }
 }
 
@@ -150,6 +179,7 @@ fn render_pre_resynth_fusion(
     source_b: &[Vec<f32>],
     sample_rate: f32,
     freeze_point_a_pct: f32,
+    volume_a_pct: f32,
     formant_shift_a_semitones: f32,
     fusion: &FusionRenderParams,
     stereo_width_pct: f32,
@@ -169,10 +199,10 @@ fn render_pre_resynth_fusion(
     let out_len = num_hops * HOP_SIZE;
     let width = width_multiplier(stereo_width_pct);
 
-    let mut a_l = analyze_freeze_point(a_left, freeze_point_a_pct, &fft);
-    let mut a_r = analyze_freeze_point(a_right, freeze_point_a_pct, &fft);
-    let mut b_l = analyze_freeze_point(b_left, fusion.freeze_point_b_pct, &fft);
-    let mut b_r = analyze_freeze_point(b_right, fusion.freeze_point_b_pct, &fft);
+    let mut a_l = analyze_freeze_point(a_left, freeze_point_a_pct, volume_a_pct, &fft);
+    let mut a_r = analyze_freeze_point(a_right, freeze_point_a_pct, volume_a_pct, &fft);
+    let mut b_l = analyze_freeze_point(b_left, fusion.freeze_point_b_pct, fusion.volume_b_pct, &fft);
+    let mut b_r = analyze_freeze_point(b_right, fusion.freeze_point_b_pct, fusion.volume_b_pct, &fft);
     a_l.mag = apply_formant_shift(a_l.mag, formant_shift_a_semitones, &fft);
     a_r.mag = apply_formant_shift(a_r.mag, formant_shift_a_semitones, &fft);
     b_l.mag = apply_formant_shift(b_l.mag, fusion.formant_shift_b_semitones, &fft);
@@ -205,13 +235,21 @@ fn render_pre_resynth_fusion(
         // so bring the result back toward Sample A's own peak rather than
         // let it swing arbitrarily loud or quiet as Amount changes. The
         // reference is A's own *rendered* peak (via the same
-        // analyze/resynth pipeline), not its raw time-domain peak - phase-
-        // vocoder reconstruction doesn't preserve peak amplitude exactly,
-        // so normalizing against the raw source would apply a small,
-        // spurious scale even at 0% Amount (where the combined spectrum is
-        // otherwise bit-identical to plain A).
-        let a_reference =
-            render_frozen_loop(source_a, sample_rate, freeze_point_a_pct, formant_shift_a_semitones, stereo_width_pct, loop_length_seconds, root_note);
+        // analyze/resynth pipeline, including its own Volume), not its raw
+        // time-domain peak - phase-vocoder reconstruction doesn't preserve
+        // peak amplitude exactly, so normalizing against the raw source
+        // would apply a small, spurious scale even at 0% Amount (where the
+        // combined spectrum is otherwise bit-identical to plain A).
+        let a_reference = render_frozen_loop(
+            source_a,
+            sample_rate,
+            freeze_point_a_pct,
+            volume_a_pct,
+            formant_shift_a_semitones,
+            stereo_width_pct,
+            loop_length_seconds,
+            root_note,
+        );
         let target_peak = a_reference.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs())).max(1e-6);
         peak_normalize(&mut channels, target_peak);
     }
@@ -297,14 +335,15 @@ fn spectral_select(a: &FrozenSpectrum, b: &FrozenSpectrum, want_max: bool) -> Fr
 
 /// Off / Audition / Mix / Ring Modulate / Cycle: each of A and B is fully,
 /// independently resynthesized via the existing, unmodified
-/// `render_frozen_loop` (each already applies its own formant shift and
-/// stereo width), then combined as plain audio buffers.
+/// `render_frozen_loop` (each already applies its own volume, formant
+/// shift, and stereo width), then combined as plain audio buffers.
 #[allow(clippy::too_many_arguments)]
 fn render_post_resynth_fusion(
     source_a: &[Vec<f32>],
     source_b: &[Vec<f32>],
     sample_rate: f32,
     freeze_point_a_pct: f32,
+    volume_a_pct: f32,
     formant_shift_a_semitones: f32,
     fusion: &FusionRenderParams,
     stereo_width_pct: f32,
@@ -312,24 +351,42 @@ fn render_post_resynth_fusion(
     root_note: u8,
 ) -> LoopBufferData {
     match fusion.mode {
-        FusionMode::Off => {
-            render_frozen_loop(source_a, sample_rate, freeze_point_a_pct, formant_shift_a_semitones, stereo_width_pct, loop_length_seconds, root_note)
-        }
+        FusionMode::Off => render_frozen_loop(
+            source_a,
+            sample_rate,
+            freeze_point_a_pct,
+            volume_a_pct,
+            formant_shift_a_semitones,
+            stereo_width_pct,
+            loop_length_seconds,
+            root_note,
+        ),
         FusionMode::Audition => render_frozen_loop(
             source_b,
             sample_rate,
             fusion.freeze_point_b_pct,
+            fusion.volume_b_pct,
             fusion.formant_shift_b_semitones,
             stereo_width_pct,
             loop_length_seconds,
             root_note,
         ),
         FusionMode::Mix | FusionMode::RingModulate | FusionMode::Cycle => {
-            let a = render_frozen_loop(source_a, sample_rate, freeze_point_a_pct, formant_shift_a_semitones, stereo_width_pct, loop_length_seconds, root_note);
+            let a = render_frozen_loop(
+                source_a,
+                sample_rate,
+                freeze_point_a_pct,
+                volume_a_pct,
+                formant_shift_a_semitones,
+                stereo_width_pct,
+                loop_length_seconds,
+                root_note,
+            );
             let b = render_frozen_loop(
                 source_b,
                 sample_rate,
                 fusion.freeze_point_b_pct,
+                fusion.volume_b_pct,
                 fusion.formant_shift_b_semitones,
                 stereo_width_pct,
                 loop_length_seconds,
@@ -436,9 +493,9 @@ mod tests {
     #[test]
     fn off_mode_matches_plain_render_frozen_loop() {
         let a = source_a();
-        let expected = render_frozen_loop(&a, SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&a, SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
         let fusion = FusionRenderParams { mode: FusionMode::Off, ..off_params() };
-        let actual = render_fused_loop(&a, &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&a, &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         assert_eq!(actual.channels[0], expected.channels[0]);
         assert_eq!(actual.channels[1], expected.channels[1]);
     }
@@ -447,16 +504,16 @@ mod tests {
     fn audition_mode_matches_b_alone() {
         let b = source_b();
         let fusion = FusionRenderParams { mode: FusionMode::Audition, freeze_point_b_pct: 40.0, ..off_params() };
-        let expected = render_frozen_loop(&b, SAMPLE_RATE, 40.0, 0.0, 0.0, 1.0, 60);
-        let actual = render_fused_loop(&source_a(), &b, SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&b, SAMPLE_RATE, 40.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&source_a(), &b, SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         assert_eq!(actual.channels[0], expected.channels[0]);
     }
 
     #[test]
     fn mix_at_zero_is_plain_a() {
         let fusion = FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 0.0, ..off_params() };
-        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         for (x, y) in actual.channels[0].iter().zip(expected.channels[0].iter()) {
             assert!((x - y).abs() < 1e-5);
         }
@@ -465,8 +522,8 @@ mod tests {
     #[test]
     fn mix_at_hundred_is_plain_b() {
         let fusion = FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 100.0, ..off_params() };
-        let expected = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 0.0, 0.0, 1.0, 60);
-        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         for (x, y) in actual.channels[0].iter().zip(expected.channels[0].iter()) {
             assert!((x - y).abs() < 1e-5);
         }
@@ -475,9 +532,9 @@ mod tests {
     #[test]
     fn mix_at_fifty_is_between_a_and_b() {
         let fusion = FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 50.0, ..off_params() };
-        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let b_alone = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 0.0, 0.0, 1.0, 60);
-        let mixed = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let b_alone = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let mixed = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         for i in 0..mixed.channels[0].len() {
             let expected = 0.5 * a_alone.channels[0][i] + 0.5 * b_alone.channels[0][i];
             assert!((mixed.channels[0][i] - expected).abs() < 1e-5);
@@ -487,8 +544,8 @@ mod tests {
     #[test]
     fn cross_synth_at_zero_amount_is_close_to_plain_a() {
         let fusion = FusionRenderParams { mode: FusionMode::CrossSynth, cross_synth_amount_pct: 0.0, ..off_params() };
-        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         // Cepstral envelope round-trip is a smoothed approximation, not a
         // perfect identity, so allow a small tolerance rather than exact
         // equality.
@@ -502,8 +559,8 @@ mod tests {
     #[test]
     fn cross_synth_at_full_amount_differs_from_plain_a() {
         let fusion = FusionRenderParams { mode: FusionMode::CrossSynth, cross_synth_amount_pct: 100.0, ..off_params() };
-        let plain_a = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let plain_a = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         let diff_energy: f32 = fused.channels[0].iter().zip(plain_a.channels[0].iter()).map(|(x, y)| (x - y).powi(2)).sum();
         assert!(diff_energy > 1e-6, "expected full Cross-Synth to audibly differ from plain A");
     }
@@ -511,8 +568,8 @@ mod tests {
     #[test]
     fn convolve_at_zero_amount_is_plain_a() {
         let fusion = FusionRenderParams { mode: FusionMode::Convolve, convolve_amount_pct: 0.0, ..off_params() };
-        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let expected = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let actual = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         for (x, y) in actual.channels[0].iter().zip(expected.channels[0].iter()) {
             assert!((x - y).abs() < 1e-4);
         }
@@ -521,9 +578,9 @@ mod tests {
     #[test]
     fn convolve_output_stays_peak_normalized_near_as_own_peak() {
         let fusion = FusionRenderParams { mode: FusionMode::Convolve, convolve_amount_pct: 100.0, ..off_params() };
-        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
+        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
         let a_peak = a_alone.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
-        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         let fused_peak = fused.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
         assert!((fused_peak - a_peak).abs() < 1e-3, "expected Convolve output peak-normalized near A's own peak ({}), got {}", a_peak, fused_peak);
     }
@@ -549,9 +606,9 @@ mod tests {
     #[test]
     fn ring_modulate_differs_from_plain_a_and_stays_peak_normalized() {
         let fusion = FusionRenderParams { mode: FusionMode::RingModulate, ring_mod_amount_pct: 100.0, ..off_params() };
-        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
+        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
         let a_peak = a_alone.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
-        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let fused = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
         let fused_peak = fused.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
         assert!((fused_peak - a_peak).abs() < 1e-3, "expected Ring Modulate output peak-normalized near A's own peak");
 
@@ -562,14 +619,30 @@ mod tests {
     #[test]
     fn cycle_buffer_is_twice_loop_length_and_each_half_matches_independent_renders() {
         let fusion = FusionRenderParams { mode: FusionMode::Cycle, ..off_params() };
-        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 0.0, 0.0, 1.0, 60);
-        let b_alone = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 0.0, 0.0, 1.0, 60);
-        let cycled = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let b_alone = render_frozen_loop(&source_b(), SAMPLE_RATE, 50.0, 100.0, 0.0, 0.0, 1.0, 60);
+        let cycled = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
 
         let one_cycle_len = a_alone.channels[0].len();
         assert_eq!(cycled.channels[0].len(), one_cycle_len * 2);
         assert_eq!(cycled.channels[0][..one_cycle_len], a_alone.channels[0][..]);
         assert_eq!(cycled.channels[0][one_cycle_len..], b_alone.channels[0][..]);
+    }
+
+    #[test]
+    fn volume_a_and_volume_b_each_attenuate_their_own_source_in_mix_mode() {
+        // Volume must apply per-source, not as a single overall trim -
+        // halving A's Volume should halve only A's contribution.
+        let fusion = FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 50.0, volume_b_pct: 100.0, ..off_params() };
+        let full = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 0.0, 1.0, 60);
+        let half_a = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 50.0, 0.0, &fusion, 0.0, 1.0, 60);
+
+        let a_alone = render_frozen_loop(&source_a(), SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, 1.0, 60);
+        for i in 0..full.channels[0].len() {
+            let expected_drop = 0.5 * a_alone.channels[0][i] * 0.5; // half of A's 50%-mix share
+            let actual_drop = full.channels[0][i] - half_a.channels[0][i];
+            assert!((actual_drop - expected_drop).abs() < 1e-4, "at sample {}: expected drop {}, got {}", i, expected_drop, actual_drop);
+        }
     }
 
     #[test]
@@ -587,7 +660,7 @@ mod tests {
         ];
         for mode in modes {
             let fusion = FusionRenderParams { mode, ..off_params() };
-            let result = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 0.0, &fusion, 30.0, 1.0, 60);
+            let result = render_fused_loop(&source_a(), &source_b(), SAMPLE_RATE, 30.0, 100.0, 0.0, &fusion, 30.0, 1.0, 60);
             assert_eq!(result.channels.len(), 2, "mode {:?} did not output stereo", mode);
             assert!(!result.channels[0].is_empty(), "mode {:?} produced an empty buffer", mode);
             for &s in result.channels.iter().flatten() {

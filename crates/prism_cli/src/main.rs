@@ -105,6 +105,7 @@ fn main() {
         &channels,
         sample_rate,
         args.freeze_point,
+        100.0,
         args.formant_shift,
         args.stereo_width,
         args.loop_length,

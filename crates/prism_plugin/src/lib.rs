@@ -18,9 +18,12 @@ use std::sync::{Arc, Mutex};
 const NO_NOTE: u8 = 255;
 
 /// YYYYMMDD, stamped at compile time by `build.rs` - shown in the editor's
-/// bottom-right corner and saved into every exported preset, so it's
-/// possible to tell which plugin version made a given sound.
+/// heading and bottom-right corner, and saved into every exported preset,
+/// so it's possible to tell which plugin version made a given sound.
 const BUILD_NUMBER: &str = env!("SPECTRALPRISM_BUILD_NUMBER");
+/// The same build date spelled out ("11 September 2026"), also stamped by
+/// `build.rs` - shown alongside `BUILD_NUMBER` in the editor's heading.
+const BUILD_DATE_HUMAN: &str = env!("SPECTRALPRISM_BUILD_DATE_HUMAN");
 
 /// The loop buffer is baked from a source sample (the built-in placeholder
 /// tone until a real file is loaded via the editor's "Load Sample" button)
@@ -129,8 +132,13 @@ const RENDER_THROTTLE_MS: f32 = 100.0;
 /// until bumped. The `ScrollArea` safety net (see `editor()`) means nothing
 /// is ever actually clipped/lost in the meantime, just not visible without
 /// scrolling.
-const BASE_EDITOR_WIDTH: u32 = 800;
-const BASE_EDITOR_HEIGHT: u32 = 640;
+/// Widened (800->1040) and shortened (640->560) again for the three-column
+/// layout (Sample A/B + Fusion, Envelope + 5 sliders, remaining 5 sliders) -
+/// splitting the old single 10-slider right column in half needs more
+/// horizontal room per column to stay legible, but reclaims roughly that
+/// same amount of vertical space back.
+const BASE_EDITOR_WIDTH: u32 = 1040;
+const BASE_EDITOR_HEIGHT: u32 = 560;
 /// The editor opens at this multiple of the base size by default (matching
 /// `apply_gui_scale`'s scale factor, since the two are computed from the
 /// same base) - requested directly ("too small to read" at 1x, then a
@@ -143,6 +151,16 @@ const DEFAULT_SCALE: f32 = 1.875;
 /// of scale - requested directly after the ADSR graph's own (taller) 90.0
 /// default made the two columns visibly mismatched.
 const GRAPH_HEIGHT: f32 = 70.0;
+
+/// Fixed height (1x-scale points, multiplied by `scale` like everything
+/// else) for the Spectral Fusion info box, so its position - right above
+/// the Load Sample buttons - and the rest of the layout around it stay put
+/// as the selected mode's description changes length. A `ScrollArea` inside
+/// it is still the hard backstop against any description ever needing more
+/// room than this. 60% of the original 56.0 - every description is capped
+/// at two sentences, so the original height was more headroom than any of
+/// them actually need.
+const INFO_BOX_HEIGHT: f32 = 33.6;
 
 /// Blank space around the outside of the whole editor's content, in 1x-scale
 /// points (multiplied by `scale` like everything else) - requested directly
@@ -314,7 +332,7 @@ impl FusionMode {
     }
 
     /// The stable id this mode is saved/restored as in the plugin's own
-    /// preset `.json` files - a string, not the enum itself, so a future
+    /// preset `.spjson` files - a string, not the enum itself, so a future
     /// variant reordering can't silently reinterpret an old preset (mirrors
     /// nih_plug's own `#[id]`-based automation-safety story for the real
     /// param). An unrecognized id (a preset from a newer plugin version, or
@@ -348,18 +366,22 @@ impl FusionMode {
     }
 
     /// Two teaching-oriented sentences describing the currently selected
-    /// algorithm, shown in the editor's info box underneath Sample B.
+    /// algorithm, shown in the editor's info box underneath Sample B -
+    /// prefixed with "Single | <Name>: " for the two modes that only ever
+    /// play one sample unmodified (Off, Audition), or "Fusion | <Name>: "
+    /// for every mode that actually combines A and B, so the box always
+    /// names what's currently selected before explaining it.
     fn info_text(self) -> &'static str {
         match self {
-            FusionMode::Off => "Only Sample A's frozen snapshot plays. A Freeze Point captures a single spectral instant of a sample and loops it forever, which is the whole idea behind SpectralPrism.",
-            FusionMode::Audition => "Only Sample B's frozen snapshot plays, and Sample A is ignored entirely. Useful for previewing what Sample B sounds like frozen on its own before blending it in.",
-            FusionMode::Mix => "A's and B's independently frozen loops are crossfaded together using the Mix Blend slider. At 0% you hear pure A, at 100% pure B, and in between a simple volume blend of both.",
-            FusionMode::CrossSynth => "B's overall spectral shape (formants) is imposed onto A's fine detail and phase, so A keeps its texture but takes on B's tonal color. The Amount slider fades this reshaping in from A's own shape (0%) to B's shape (100%).",
-            FusionMode::Convolve => "A's and B's frozen spectra are multiplied together bin by bin, which is how audio convolution works in the frequency domain. This tends to produce dense, resonant, often unpredictable new timbres, dialed in with the Amount slider.",
-            FusionMode::RingModulate => "A's and B's resynthesized loops are multiplied together sample by sample, the classic ring-modulation technique. This creates metallic, bell-like inharmonic tones, blended against plain A with the Amount slider.",
-            FusionMode::SpectralMax => "At every frequency bin, whichever of A or B is louder there wins and is used in the output. The result favors each source's strongest frequencies, often sounding brighter or more aggressive than either alone.",
-            FusionMode::SpectralMin => "At every frequency bin, whichever of A or B is quieter there wins and is used in the output. The result keeps only what both sources have in common, often sounding darker or thinner than either alone.",
-            FusionMode::Cycle => "One full loop of A's frozen sound plays, then one full loop of B's, then it repeats - an alternating pattern rather than a blend. Good for rhythmic back-and-forth textures instead of a simultaneous combination.",
+            FusionMode::Off => "Single | Freeze: Only Sample A's frozen snapshot plays. A Freeze Point captures a single spectral instant of a sample and loops it forever, which is the whole idea behind SpectralPrism.",
+            FusionMode::Audition => "Single | Audition: Only Sample B's frozen snapshot plays, and Sample A is ignored entirely. Useful for previewing what Sample B sounds like frozen on its own before blending it in.",
+            FusionMode::Mix => "Fusion | Mix: A's and B's independently frozen loops are crossfaded together using the Mix Blend slider. At 0% you hear pure A, at 100% pure B, and in between a simple volume blend of both.",
+            FusionMode::CrossSynth => "Fusion | Cross-Synth: B's overall spectral shape (formants) is imposed onto A's fine detail and phase, so A keeps its texture but takes on B's tonal color. The Amount slider fades this reshaping in from A's own shape (0%) to B's shape (100%).",
+            FusionMode::Convolve => "Fusion | Convolve: A's and B's frozen spectra are multiplied together bin by bin, which is how audio convolution works in the frequency domain. This tends to produce dense, resonant, often unpredictable new timbres, dialed in with the Amount slider.",
+            FusionMode::RingModulate => "Fusion | Ring Modulation: A's and B's resynthesized loops are multiplied together sample by sample, the classic ring-modulation technique. This creates metallic, bell-like inharmonic tones, blended against plain A with the Amount slider.",
+            FusionMode::SpectralMax => "Fusion | Spectral Max: At every frequency bin, whichever of A or B is louder there wins and is used in the output. The result favors each source's strongest frequencies, often sounding brighter or more aggressive than either alone.",
+            FusionMode::SpectralMin => "Fusion | Spectral Min: At every frequency bin, whichever of A or B is quieter there wins and is used in the output. The result keeps only what both sources have in common, often sounding darker or thinner than either alone.",
+            FusionMode::Cycle => "Fusion | Cycle: One full loop of A's frozen sound plays, then one full loop of B's, then it repeats - an alternating pattern rather than a blend. Good for rhythmic back-and-forth textures instead of a simultaneous combination.",
         }
     }
 }
@@ -402,6 +424,15 @@ struct PrismPluginParams {
     #[id = "freeze_point"]
     pub freeze_point: FloatParam,
 
+    /// Post-normalization attenuation for Sample A - files are
+    /// peak-normalized on load (`peak_normalize_channels`), so this only
+    /// ever turns Sample A down from that normalized level, never up (its
+    /// `FloatRange` tops out at 100%). See
+    /// `prism_dsp::freeze::analyze_freeze_point`'s `gain_pct` doc comment
+    /// for where this is actually applied.
+    #[id = "sample_a_volume"]
+    pub sample_a_volume: FloatParam,
+
     #[id = "formant_shift"]
     pub formant_shift: FloatParam,
 
@@ -417,6 +448,11 @@ struct PrismPluginParams {
     /// meaningful once `fusion_mode` is anything but `Off`.
     #[id = "freeze_point_b"]
     pub freeze_point_b: FloatParam,
+
+    /// Sample B's own Volume, mirroring `sample_a_volume` - post-
+    /// normalization attenuation only, never a boost.
+    #[id = "sample_b_volume"]
+    pub sample_b_volume: FloatParam,
 
     /// Sample B's own Formant Shift, independent of Sample A's.
     #[id = "formant_shift_b"]
@@ -498,6 +534,7 @@ impl Default for PrismPlugin {
             pitch_bend_normalized: 0.5,
             last_requested: RenderRequest {
                 freeze_point_pct: 50.0,
+                volume_pct: 100.0,
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 30.0,
                 loop_length_seconds: prism_dsp::render::DEFAULT_LOOP_SECONDS,
@@ -523,6 +560,12 @@ impl Default for PrismPluginParams {
             sample_path_b: Mutex::new(None),
             freeze_point: FloatParam::new("Freeze Point", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
+            // 100% (unity, at the peak-normalized load level) is the
+            // correct default - anything lower would silently attenuate a
+            // freshly loaded sample for no reason. The range's own 100%
+            // ceiling is what enforces "can only reduce, never boost".
+            sample_a_volume: FloatParam::new("Volume", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
             formant_shift: FloatParam::new(
                 "Formant Shift",
                 0.0,
@@ -533,6 +576,8 @@ impl Default for PrismPluginParams {
                 .with_unit(" %"),
             fusion_mode: EnumParam::new("Spectral Fusion", FusionMode::Off),
             freeze_point_b: FloatParam::new("Freeze Point B", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_unit(" %"),
+            sample_b_volume: FloatParam::new("Volume", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
             formant_shift_b: FloatParam::new("Formant Shift B", 0.0, FloatRange::Linear { min: -12.0, max: 12.0 })
                 .with_unit(" st"),
@@ -669,13 +714,39 @@ fn prepare_source_for_plugin_rate(channels: Vec<Vec<f32>>, file_rate: f32, plugi
     }
 }
 
-/// Combines `load_wav_channels` and `prepare_source_for_plugin_rate` - the
-/// full "get a WAV file's audio ready to be frozen at this sample rate"
-/// step, shared by the interactive "Load Sample..."/"[ Load Sample ]" flow,
-/// project-recall in `initialize()`, and preset recall in `apply_preset()`.
+/// Scales every channel by the same factor so the loudest sample across all
+/// of them hits unity - so a quiet file and a loud file freeze to
+/// comparable levels rather than one needing a much higher Freeze Point
+/// "loudness" than the other by accident of how it happened to be recorded.
+/// A silent file (all-zero, or already effectively silent) is left alone
+/// rather than divided by ~0. This runs once at load time; the per-sample
+/// Volume slider (`sample_a_volume`/`sample_b_volume`) then only ever
+/// *attenuates* from this normalized level, applied at render time (see
+/// `prism_dsp::freeze::analyze_freeze_point`'s `gain_pct` parameter) rather
+/// than baked into the stored audio, so it can be freely readjusted without
+/// re-loading the file.
+fn peak_normalize_channels(channels: &mut [Vec<f32>]) {
+    let peak = channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak > 1e-6 {
+        let scale = 1.0 / peak;
+        for channel in channels.iter_mut() {
+            for sample in channel.iter_mut() {
+                *sample *= scale;
+            }
+        }
+    }
+}
+
+/// Combines `load_wav_channels`, `prepare_source_for_plugin_rate`, and
+/// `peak_normalize_channels` - the full "get a WAV file's audio ready to be
+/// frozen at this sample rate" step, shared by the interactive "Load Sample
+/// A/B..." flow, project-recall in `initialize()`, and preset recall in
+/// `apply_preset()`.
 fn load_and_prepare_sample(path: &Path, plugin_rate: f32) -> Result<Vec<Vec<f32>>, String> {
     let (channels, file_rate) = load_wav_channels(path)?;
-    Ok(prepare_source_for_plugin_rate(channels, file_rate, plugin_rate))
+    let mut prepared = prepare_source_for_plugin_rate(channels, file_rate, plugin_rate);
+    peak_normalize_channels(&mut prepared);
+    Ok(prepared)
 }
 
 /// Every DSP-relevant param bundled into one `RenderRequest`, including the
@@ -686,6 +757,7 @@ fn load_and_prepare_sample(path: &Path, plugin_rate: f32) -> Result<Vec<Vec<f32>
 fn current_render_request(params: &PrismPluginParams) -> RenderRequest {
     RenderRequest {
         freeze_point_pct: params.freeze_point.value(),
+        volume_pct: params.sample_a_volume.value(),
         formant_shift_semitones: params.formant_shift.value(),
         stereo_width_pct: params.stereo_width.value(),
         loop_length_seconds: params.loop_length_seconds.value(),
@@ -693,6 +765,7 @@ fn current_render_request(params: &PrismPluginParams) -> RenderRequest {
             mode: params.fusion_mode.value().to_dsp(),
             freeze_point_b_pct: params.freeze_point_b.value(),
             formant_shift_b_semitones: params.formant_shift_b.value(),
+            volume_b_pct: params.sample_b_volume.value(),
             mix_amount_pct: params.fusion_mix_amount.value(),
             cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
             convolve_amount_pct: params.fusion_convolve_amount.value(),
@@ -773,6 +846,11 @@ fn write_loop_buffer_wav(path: &Path, buffer: &LoopBufferData) -> Result<(), Str
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Preset {
     freeze_point_pct: f32,
+    /// `#[serde(default = "default_volume_pct")]` (100%, unity at the
+    /// peak-normalized load level) - a preset saved before Volume existed
+    /// must still play at its original level, not silently attenuated.
+    #[serde(default = "default_volume_pct")]
+    volume_a_pct: f32,
     formant_shift_semitones: f32,
     stereo_width_pct: f32,
     /// `#[serde(default)]` with a custom default fn (not the bare
@@ -826,6 +904,9 @@ struct Preset {
     /// value the way 0.0 is for a shift or a percentage blend.
     #[serde(default = "default_freeze_point_b_pct")]
     freeze_point_b_pct: f32,
+    /// Mirrors `volume_a_pct` above for Sample B.
+    #[serde(default = "default_volume_pct")]
+    volume_b_pct: f32,
     #[serde(default)]
     formant_shift_b_semitones: f32,
     /// `#[serde(default = "default_fusion_mix_amount_pct")]`: Mix is a
@@ -860,6 +941,10 @@ fn default_freeze_point_b_pct() -> f32 {
     50.0
 }
 
+fn default_volume_pct() -> f32 {
+    100.0
+}
+
 fn default_fusion_mix_amount_pct() -> f32 {
     50.0
 }
@@ -872,6 +957,7 @@ impl Preset {
     fn capture(params: &PrismPluginParams) -> Self {
         Self {
             freeze_point_pct: params.freeze_point.value(),
+            volume_a_pct: params.sample_a_volume.value(),
             formant_shift_semitones: params.formant_shift.value(),
             stereo_width_pct: params.stereo_width.value(),
             loop_length_seconds: params.loop_length_seconds.value(),
@@ -887,6 +973,7 @@ impl Preset {
             build_number: BUILD_NUMBER.to_string(),
             fusion_mode: params.fusion_mode.value().preset_id().to_string(),
             freeze_point_b_pct: params.freeze_point_b.value(),
+            volume_b_pct: params.sample_b_volume.value(),
             formant_shift_b_semitones: params.formant_shift_b.value(),
             fusion_mix_amount_pct: params.fusion_mix_amount.value(),
             fusion_cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
@@ -909,12 +996,18 @@ fn presets_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// `.spjson` (not plain `.json`) - still JSON content, but a distinct
+/// extension so SpectralPrism's own presets can be filtered out from a
+/// user's other, unrelated `.json` files (in a file picker, a search, a
+/// sync folder, etc).
+const PRESET_FILE_EXTENSION: &str = "spjson";
+
 fn preset_file_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}.json"))
+    dir.join(format!("{name}.{PRESET_FILE_EXTENSION}"))
 }
 
 /// Sorted (so Prev/Next and the dropdown have a stable, predictable order)
-/// list of preset names, without the `.json` extension, found in `dir`. An
+/// list of preset names, without the `.spjson` extension, found in `dir`. An
 /// unreadable directory (shouldn't happen once `presets_dir()` has
 /// succeeded once, but e.g. permissions could change) just yields no
 /// presets rather than an error - there's no interactive action to blame it
@@ -923,7 +1016,7 @@ fn list_presets(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == PRESET_FILE_EXTENSION))
         .filter_map(|entry| entry.path().file_stem().map(|stem| stem.to_string_lossy().into_owned()))
         .collect();
     names.sort();
@@ -1005,6 +1098,62 @@ fn apply_gui_scale(ctx: &egui::Context, scale: f32) {
     });
 }
 
+/// Width (1x-scale points) of `draw_vertical_volume_slider` - drawn inside
+/// the same `ui.horizontal` as `draw_freeze_point_waveform`, so the
+/// waveform (which sizes itself to whatever `ui.available_width()` is left
+/// once this has claimed its own space) automatically ends up narrower by
+/// exactly this much, no manual arithmetic needed at the call site.
+const VOLUME_SLIDER_WIDTH: f32 = 28.0;
+
+/// A vertical fader for a sample's Volume, meant to sit directly to the
+/// left of that sample's `draw_freeze_point_waveform` (`nih_plug_egui`'s
+/// `ParamSlider` is horizontal-only - see its own doc comment - so this is
+/// hand-painted the same way `draw_freeze_point_waveform`/`draw_adsr_graph`
+/// already are). A fixed-size percentage readout sits above a click/drag
+/// track - dragging (or clicking) anywhere in the track sets the value via
+/// the same begin/set/end-normalized pattern every other custom control
+/// here uses, with the fill growing up from the bottom (louder = taller, a
+/// fader without a legend needed).
+fn draw_vertical_volume_slider(ui: &mut egui::Ui, volume: &FloatParam, setter: &ParamSetter, height: f32, scale: f32) {
+    let width = VOLUME_SLIDER_WIDTH * scale;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+
+    let readout_height = 14.0 * scale;
+    let track_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + readout_height), rect.max);
+
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + readout_height * 0.5),
+        egui::Align2::CENTER_CENTER,
+        format!("{:.0}%", volume.value()),
+        egui::FontId::proportional(9.0 * scale),
+        COLOR_DIM,
+    );
+
+    painter.rect_filled(track_rect, 2.0, COLOR_SURFACE_DEEP);
+    let value = volume.unmodulated_normalized_value();
+    let fill_top = track_rect.bottom() - track_rect.height() * value;
+    let fill_rect = egui::Rect::from_min_max(egui::pos2(track_rect.left(), fill_top), track_rect.max);
+    painter.rect_filled(fill_rect, 2.0, COLOR_ACCENT);
+    painter.rect_stroke(track_rect, 2.0, egui::Stroke::new(1.0, COLOR_EDGE), egui::StrokeKind::Inside);
+
+    if response.drag_started() || response.clicked() {
+        setter.begin_set_parameter(volume);
+    }
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let normalized = 1.0 - ((pos.y - track_rect.top()) / track_rect.height().max(1.0)).clamp(0.0, 1.0);
+            setter.set_parameter_normalized(volume, normalized);
+        }
+    }
+    if response.drag_stopped() || response.clicked() {
+        setter.end_set_parameter(volume);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+}
+
 /// Draws the loaded source's waveform (min/max per pixel column, since the
 /// source is almost always much longer than the display is wide) with a
 /// vertical marker at Freeze Point's current position, so the user can see
@@ -1022,14 +1171,17 @@ fn apply_gui_scale(ctx: &egui::Context, scale: f32) {
 /// `true` on the frame it's clicked, so the caller (which owns the actual
 /// file dialog / decode logic, shared with the "Load Sample..." button
 /// below) can open it in response.
+#[allow(clippy::too_many_arguments)]
 fn draw_freeze_point_waveform(
     ui: &mut egui::Ui,
     source: &Arc<ArcSwap<Vec<Vec<f32>>>>,
     freeze_point: &FloatParam,
+    volume_pct: f32,
     setter: &ParamSetter,
     has_loaded_sample: bool,
     scale: f32,
 ) -> bool {
+    let volume = (volume_pct / 100.0).clamp(0.0, 1.0);
     let desired_size = egui::vec2(ui.available_width(), GRAPH_HEIGHT * scale);
     let painter = ui.painter().clone();
 
@@ -1080,6 +1232,10 @@ fn draw_freeze_point_waveform(
         let slice = &samples[start..end];
         let (min_v, max_v) =
             slice.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &s| (mn.min(s), mx.max(s)));
+        // Scaled by the sample's own Volume slider so the drawn waveform's
+        // height reflects what will actually be heard, not the underlying
+        // peak-normalized audio's own (always-100%) amplitude.
+        let (min_v, max_v) = (min_v * volume, max_v * volume);
         let x = rect.left() + px as f32;
         let y_top = mid_y - max_v.clamp(-1.0, 1.0) * half_height;
         let y_bottom = (mid_y - min_v.clamp(-1.0, 1.0) * half_height).max(y_top + 1.0);
@@ -1353,6 +1509,7 @@ impl Plugin for PrismPlugin {
                         setter.end_set_parameter(param);
                     };
                     set(&params.freeze_point, preset.freeze_point_pct);
+                    set(&params.sample_a_volume, preset.volume_a_pct);
                     set(&params.formant_shift, preset.formant_shift_semitones);
                     set(&params.stereo_width, preset.stereo_width_pct);
                     set(&params.loop_length_seconds, preset.loop_length_seconds);
@@ -1365,6 +1522,7 @@ impl Plugin for PrismPlugin {
                     set(&params.pan_center_pct, preset.pan_center_pct);
                     set(&params.pan_width_pct, preset.pan_width_pct);
                     set(&params.freeze_point_b, preset.freeze_point_b_pct);
+                    set(&params.sample_b_volume, preset.volume_b_pct);
                     set(&params.formant_shift_b, preset.formant_shift_b_semitones);
                     set(&params.fusion_mix_amount, preset.fusion_mix_amount_pct);
                     set(&params.fusion_cross_synth_amount, preset.fusion_cross_synth_amount_pct);
@@ -1407,7 +1565,7 @@ impl Plugin for PrismPlugin {
                     .show(egui_ctx, &params.editor_state, |ui| {
                         egui::Frame::default().inner_margin(egui::Margin::same((EDITOR_MARGIN * scale) as i8)).show(ui, |ui| {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        ui.heading("SpectralPrism");
+                        ui.heading(format!("SpectralPrism | v{BUILD_NUMBER} (for {BUILD_DATE_HUMAN})"));
 
                         let presets_dir = presets_dir();
                         let preset_names = presets_dir.as_deref().map(list_presets).unwrap_or_default();
@@ -1454,6 +1612,12 @@ impl Plugin for PrismPlugin {
                             }
                         };
 
+                        // One row for the whole preset toolbar - Prev/combo/
+                        // Next, the Save-as-name field, and Import/Export -
+                        // there was plenty of horizontal room to avoid
+                        // stacking these three groups as separate rows.
+                        // Thin vertical separators mark the group
+                        // boundaries.
                         ui.horizontal(|ui| {
                             if ui.add_enabled(!preset_names.is_empty(), egui::Button::new("◀")).clicked() {
                                 let idx = current_preset_idx.map(|i| i.saturating_sub(1)).unwrap_or(0);
@@ -1476,11 +1640,13 @@ impl Plugin for PrismPlugin {
                                     .unwrap_or(0);
                                 load_preset_at(idx, state);
                             }
-                        });
-                        ui.horizontal(|ui| {
+
+                            ui.separator();
+
                             ui.add(
                                 egui::TextEdit::singleline(&mut state.preset_name_input)
-                                    .hint_text("Preset name..."),
+                                    .hint_text("Preset name...")
+                                    .desired_width(140.0 * scale),
                             );
                             let name = state.preset_name_input.trim().to_string();
                             if ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() {
@@ -1495,8 +1661,9 @@ impl Plugin for PrismPlugin {
                                     None => state.error = Some("couldn't find a presets directory ($HOME not set?)".to_string()),
                                 }
                             }
-                        });
-                        ui.horizontal(|ui| {
+
+                            ui.separator();
+
                             // Separate from the named on-disk library above
                             // (Save/◀/▶/combo, all under `presets_dir()`) -
                             // these go to/from any file the user picks, for
@@ -1504,8 +1671,9 @@ impl Plugin for PrismPlugin {
                             // alongside a sample-pack WAV export, see
                             // "Export WAV Sample..." below).
                             if ui.button("Import Preset...").clicked() {
-                                if let Some(path) =
-                                    rfd::FileDialog::new().add_filter("SpectralPrism Preset", &["json"]).pick_file()
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("SpectralPrism Preset", &[PRESET_FILE_EXTENSION])
+                                    .pick_file()
                                 {
                                     match read_preset_file(&path) {
                                         Ok(mut preset) => {
@@ -1544,8 +1712,8 @@ impl Plugin for PrismPlugin {
                             }
                             if ui.button("Export Preset...").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("SpectralPrism Preset", &["json"])
-                                    .set_file_name("preset.json")
+                                    .add_filter("SpectralPrism Preset", &[PRESET_FILE_EXTENSION])
+                                    .set_file_name(&format!("preset.{PRESET_FILE_EXTENSION}"))
                                     .save_file()
                                 {
                                     match write_preset_file(&path, &Preset::capture(&params)) {
@@ -1563,17 +1731,24 @@ impl Plugin for PrismPlugin {
 
                         ui.add_space(8.0);
 
-                        // The two main sections side by side rather than
-                        // stacked - requested directly, and it also keeps
-                        // the window from getting extremely tall now that
-                        // everything renders at `DEFAULT_SCALE`.
-                        ui.columns(2, |columns| {
+                        // Three sections side by side rather than two long
+                        // stacked columns - requested directly, so the
+                        // window grows wider instead of needing to scroll
+                        // to see the bottom row of controls.
+                        ui.columns(3, |columns| {
                             let left = &mut columns[0];
-                            left.label("Freeze Point");
+                            left.label("Sample A");
                             let has_loaded_sample = loaded_filename.load().is_some();
-                            if draw_freeze_point_waveform(left, &source, &params.freeze_point, setter, has_loaded_sample, scale) {
+                            let clicked_load_a = left
+                                .horizontal(|ui| {
+                                    draw_vertical_volume_slider(ui, &params.sample_a_volume, setter, GRAPH_HEIGHT * scale, scale);
+                                    draw_freeze_point_waveform(ui, &source, &params.freeze_point, params.sample_a_volume.value(), setter, has_loaded_sample, scale)
+                                })
+                                .inner;
+                            if clicked_load_a {
                                 open_sample_dialog(state);
                             }
+                            left.label("Freeze Point");
                             left.add(widgets::ParamSlider::for_param(&params.freeze_point, setter));
 
                             left.label("Formant Shift");
@@ -1597,14 +1772,29 @@ impl Plugin for PrismPlugin {
 
                             if current_fusion != FusionMode::Off {
                                 left.add_space(8.0);
-                                left.label("Sample B \u{2014} Freeze Point");
+                                left.label("Sample B");
                                 let has_loaded_sample_b = loaded_filename_b.load().is_some();
-                                if draw_freeze_point_waveform(left, &source_b, &params.freeze_point_b, setter, has_loaded_sample_b, scale) {
+                                let clicked_load_b = left
+                                    .horizontal(|ui| {
+                                        draw_vertical_volume_slider(ui, &params.sample_b_volume, setter, GRAPH_HEIGHT * scale, scale);
+                                        draw_freeze_point_waveform(
+                                            ui,
+                                            &source_b,
+                                            &params.freeze_point_b,
+                                            params.sample_b_volume.value(),
+                                            setter,
+                                            has_loaded_sample_b,
+                                            scale,
+                                        )
+                                    })
+                                    .inner;
+                                if clicked_load_b {
                                     open_sample_dialog_b(state);
                                 }
+                                left.label("Freeze Point");
                                 left.add(widgets::ParamSlider::for_param(&params.freeze_point_b, setter));
 
-                                left.label("Sample B \u{2014} Formant Shift");
+                                left.label("Formant Shift");
                                 left.add(widgets::ParamSlider::for_param(&params.formant_shift_b, setter));
 
                                 match current_fusion {
@@ -1631,34 +1821,30 @@ impl Plugin for PrismPlugin {
                                     left.add_space(4.0);
                                     left.colored_label(COLOR_ERROR, "This mode needs Sample B - load one above to hear it.");
                                 }
-
-                                left.add_space(8.0);
-                                egui::Frame::default()
-                                    .fill(COLOR_SURFACE_DEEP)
-                                    .stroke(egui::Stroke::new(1.0, COLOR_EDGE))
-                                    .inner_margin(egui::Margin::same((6.0 * scale) as i8))
-                                    .show(left, |ui| {
-                                        ui.colored_label(COLOR_DIM, current_fusion.info_text());
-                                    });
                             }
 
-                            let right = &mut columns[1];
-                            right.label("Envelope (Attack / Decay / Sustain / Release)");
-                            draw_adsr_graph(right, &params.attack, &params.decay, &params.sustain, &params.release, setter, scale);
-                            right.label("Attack");
-                            right.add(widgets::ParamSlider::for_param(&params.attack, setter));
-                            right.label("Decay");
-                            right.add(widgets::ParamSlider::for_param(&params.decay, setter));
-                            right.label("Sustain");
-                            right.add(widgets::ParamSlider::for_param(&params.sustain, setter));
-                            right.label("Release");
-                            right.add(widgets::ParamSlider::for_param(&params.release, setter));
+                            // Envelope + its 5 sliders in the middle column,
+                            // the remaining 5 (Stereo Width through Random
+                            // Pan Width) in the right column - splitting
+                            // what used to be one 10-slider column in half
+                            // so the window grows wider instead of taller.
+                            let middle = &mut columns[1];
+                            middle.label("Envelope (Attack / Decay / Sustain / Release)");
+                            draw_adsr_graph(middle, &params.attack, &params.decay, &params.sustain, &params.release, setter, scale);
+                            middle.label("Attack");
+                            middle.add(widgets::ParamSlider::for_param(&params.attack, setter));
+                            middle.label("Decay");
+                            middle.add(widgets::ParamSlider::for_param(&params.decay, setter));
+                            middle.label("Sustain");
+                            middle.add(widgets::ParamSlider::for_param(&params.sustain, setter));
+                            middle.label("Release");
+                            middle.add(widgets::ParamSlider::for_param(&params.release, setter));
 
-                            right.add_space(8.0);
-                            right.label("Velocity Sensitivity");
-                            right.add(widgets::ParamSlider::for_param(&params.velocity_sensitivity, setter));
+                            middle.add_space(8.0);
+                            middle.label("Velocity Sensitivity");
+                            middle.add(widgets::ParamSlider::for_param(&params.velocity_sensitivity, setter));
 
-                            right.add_space(8.0);
+                            let right = &mut columns[2];
                             right.label("Stereo Width");
                             right.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
 
@@ -1676,13 +1862,37 @@ impl Plugin for PrismPlugin {
                             right.add(widgets::ParamSlider::for_param(&params.pan_width_pct, setter));
                         });
 
+                        // Always visible (even in Off mode, describing plain
+                        // Spectral Freeze) rather than only while a Fusion
+                        // mode is selected, and pinned to a fixed height/
+                        // position (right above the Load Sample buttons)
+                        // rather than living inside the conditional Sample B
+                        // block, so the rest of the layout doesn't shift
+                        // around as the mode (and its description length)
+                        // changes.
+                        ui.add_space(8.0);
+                        let current_fusion = params.fusion_mode.value();
+                        egui::Frame::default()
+                            .fill(COLOR_SURFACE_DEEP)
+                            .stroke(egui::Stroke::new(1.0, COLOR_EDGE))
+                            .inner_margin(egui::Margin::same((6.0 * scale) as i8))
+                            .show(ui, |ui| {
+                                ui.set_height(INFO_BOX_HEIGHT * scale);
+                                egui::ScrollArea::vertical().max_height(INFO_BOX_HEIGHT * scale).show(ui, |ui| {
+                                    ui.colored_label(COLOR_DIM, current_fusion.info_text());
+                                });
+                            });
+
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(8.0);
 
                         ui.horizontal(|ui| {
-                            if ui.button("Load Sample...").clicked() {
+                            if ui.button("Load Sample A...").clicked() {
                                 open_sample_dialog(state);
+                            }
+                            if ui.button("Load Sample B...").clicked() {
+                                open_sample_dialog_b(state);
                             }
                             if ui.button("Export WAV Sample...").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
@@ -1781,6 +1991,7 @@ impl Plugin for PrismPlugin {
             &self.source_b.load(),
             sample_rate,
             request.freeze_point_pct,
+            request.volume_pct,
             request.formant_shift_semitones,
             &effective_fusion,
             request.stereo_width_pct,
@@ -1942,6 +2153,7 @@ mod preset_tests {
     fn sample_preset(sample_path: Option<PathBuf>) -> Preset {
         Preset {
             freeze_point_pct: 42.0,
+            volume_a_pct: 85.0,
             formant_shift_semitones: -3.5,
             stereo_width_pct: 60.0,
             loop_length_seconds: 2.5,
@@ -1957,6 +2169,7 @@ mod preset_tests {
             build_number: "20260101".to_string(),
             fusion_mode: "cross-synth".to_string(),
             freeze_point_b_pct: 65.0,
+            volume_b_pct: 90.0,
             formant_shift_b_semitones: 1.5,
             fusion_mix_amount_pct: 30.0,
             fusion_cross_synth_amount_pct: 80.0,
@@ -1973,6 +2186,7 @@ mod preset_tests {
         let restored: Preset = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.freeze_point_pct, original.freeze_point_pct);
+        assert_eq!(restored.volume_a_pct, original.volume_a_pct);
         assert_eq!(restored.formant_shift_semitones, original.formant_shift_semitones);
         assert_eq!(restored.stereo_width_pct, original.stereo_width_pct);
         assert_eq!(restored.loop_length_seconds, original.loop_length_seconds);
@@ -1988,6 +2202,7 @@ mod preset_tests {
         assert_eq!(restored.build_number, original.build_number);
         assert_eq!(restored.fusion_mode, original.fusion_mode);
         assert_eq!(restored.freeze_point_b_pct, original.freeze_point_b_pct);
+        assert_eq!(restored.volume_b_pct, original.volume_b_pct);
         assert_eq!(restored.formant_shift_b_semitones, original.formant_shift_b_semitones);
         assert_eq!(restored.fusion_mix_amount_pct, original.fusion_mix_amount_pct);
         assert_eq!(restored.fusion_cross_synth_amount_pct, original.fusion_cross_synth_amount_pct);
@@ -2015,9 +2230,11 @@ mod preset_tests {
             "sample_path": null
         }"#;
         let restored: Preset = serde_json::from_str(old_json).expect("old-format preset should still deserialize");
+        assert_eq!(restored.volume_a_pct, 100.0);
         assert_eq!(restored.fusion_mode, "");
         assert_eq!(FusionMode::from_preset_id(&restored.fusion_mode), FusionMode::Off);
         assert_eq!(restored.freeze_point_b_pct, 50.0);
+        assert_eq!(restored.volume_b_pct, 100.0);
         assert_eq!(restored.formant_shift_b_semitones, 0.0);
         assert_eq!(restored.fusion_mix_amount_pct, 50.0);
         assert_eq!(restored.fusion_cross_synth_amount_pct, 100.0);
@@ -2100,7 +2317,7 @@ mod preset_tests {
         // The file-dialog Import/Export flow, as opposed to save_preset/
         // load_preset's fixed presets_dir()-relative naming.
         let dir = temp_dir("preset_file");
-        let path = dir.join("my-shared-preset.json");
+        let path = dir.join("my-shared-preset.spjson");
         let original = sample_preset(Some(PathBuf::from("/some/sample.wav")));
 
         write_preset_file(&path, &original).expect("write should succeed");

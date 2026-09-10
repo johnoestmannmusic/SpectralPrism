@@ -31,9 +31,12 @@ pub struct LoopBufferData {
 /// Renders a frozen, indefinitely-loopable STEREO buffer (always exactly 2
 /// output channels, regardless of source channel count) from `channels`
 /// (one Vec<f32> per source channel, all the same length) at `sample_rate`,
-/// seeded from `freeze_point_pct` (0-100), shaped by
-/// `formant_shift_semitones` (-12..12), and spread by `stereo_width_pct`
-/// (0-100). `loop_length_seconds` is user-chosen (clamped to
+/// seeded from `freeze_point_pct` (0-100), attenuated by `volume_pct`
+/// (0-100, see `freeze::analyze_freeze_point`'s doc comment - this can only
+/// turn the frozen result down from `channels`' own level, never up, since
+/// `channels` is expected to already be peak-normalized at load time),
+/// shaped by `formant_shift_semitones` (-12..12), and spread by
+/// `stereo_width_pct` (0-100). `loop_length_seconds` is user-chosen (clamped to
 /// `[MIN_LOOP_SECONDS, MAX_LOOP_SECONDS]` as a sanity bound only) and
 /// constructed as an integer number of hops (`num_hops`).
 ///
@@ -80,6 +83,7 @@ pub fn render_frozen_loop(
     channels: &[Vec<f32>],
     sample_rate: f32,
     freeze_point_pct: f32,
+    volume_pct: f32,
     formant_shift_semitones: f32,
     stereo_width_pct: f32,
     loop_length_seconds: f32,
@@ -97,8 +101,8 @@ pub fn render_frozen_loop(
 
     let width = width_multiplier(stereo_width_pct);
 
-    let frozen_left = analyze_freeze_point(source_left, freeze_point_pct, &fft);
-    let frozen_right_natural = analyze_freeze_point(source_right, freeze_point_pct, &fft);
+    let frozen_left = analyze_freeze_point(source_left, freeze_point_pct, volume_pct, &fft);
+    let frozen_right_natural = analyze_freeze_point(source_right, freeze_point_pct, volume_pct, &fft);
 
     // Quantized once and shared by both channels (matching how the
     // un-quantized `advance` was already shared before this) - phase0
@@ -297,7 +301,7 @@ mod tests {
     fn loop_length_is_integer_number_of_hops() {
         let sample_rate = 48000.0;
         let signal = make_test_signal((sample_rate * 6.0) as usize);
-        let result = render_frozen_loop(&[signal], sample_rate, 30.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let result = render_frozen_loop(&[signal], sample_rate, 30.0, 100.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
         let len = result.channels[0].len();
         assert_eq!(len % HOP_SIZE, 0, "loop length {} is not a multiple of HOP_SIZE", len);
     }
@@ -307,11 +311,11 @@ mod tests {
         let sample_rate = 48000.0;
         let signal = make_test_signal((sample_rate * 5.0) as usize);
 
-        let short_result = render_frozen_loop(&[signal.clone()], sample_rate, 30.0, 0.0, 0.0, 0.0, DEFAULT_ROOT_NOTE);
+        let short_result = render_frozen_loop(&[signal.clone()], sample_rate, 30.0, 100.0, 0.0, 0.0, 0.0, DEFAULT_ROOT_NOTE);
         let short_seconds = short_result.channels[0].len() as f32 / sample_rate;
         assert!(short_seconds >= MIN_LOOP_SECONDS - 0.1, "requesting 0s should clamp up to MIN_LOOP_SECONDS, got {}", short_seconds);
 
-        let long_result = render_frozen_loop(&[signal], sample_rate, 30.0, 0.0, 0.0, 30.0, DEFAULT_ROOT_NOTE);
+        let long_result = render_frozen_loop(&[signal], sample_rate, 30.0, 100.0, 0.0, 0.0, 30.0, DEFAULT_ROOT_NOTE);
         let long_seconds = long_result.channels[0].len() as f32 / sample_rate;
         assert!(long_seconds <= MAX_LOOP_SECONDS + 0.1, "requesting 30s should clamp down to MAX_LOOP_SECONDS, got {}", long_seconds);
     }
@@ -320,7 +324,7 @@ mod tests {
     fn loop_length_seconds_is_honored_within_range() {
         let sample_rate = 48000.0;
         let signal = make_test_signal((sample_rate * 5.0) as usize);
-        let result = render_frozen_loop(&[signal], sample_rate, 30.0, 0.0, 0.0, 1.0, DEFAULT_ROOT_NOTE);
+        let result = render_frozen_loop(&[signal], sample_rate, 30.0, 100.0, 0.0, 0.0, 1.0, DEFAULT_ROOT_NOTE);
         let seconds = result.channels[0].len() as f32 / sample_rate;
         assert!((seconds - 1.0).abs() < 0.05, "expected ~1.0s loop, got {}", seconds);
     }
@@ -329,8 +333,8 @@ mod tests {
     fn deterministic_for_same_params() {
         let sample_rate = 48000.0;
         let signal = make_test_signal((sample_rate * 5.0) as usize);
-        let a = render_frozen_loop(&[signal.clone()], sample_rate, 42.0, 2.0, 30.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
-        let b = render_frozen_loop(&[signal], sample_rate, 42.0, 2.0, 30.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let a = render_frozen_loop(&[signal.clone()], sample_rate, 42.0, 100.0, 2.0, 30.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let b = render_frozen_loop(&[signal], sample_rate, 42.0, 100.0, 2.0, 30.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
         assert_eq!(a.channels[0].len(), b.channels[0].len());
         for (x, y) in a.channels[0].iter().zip(b.channels[0].iter()) {
             assert_eq!(x, y);
@@ -341,16 +345,30 @@ mod tests {
     }
 
     #[test]
+    fn volume_pct_attenuates_final_rendered_output() {
+        let sample_rate = 48000.0;
+        let signal = make_test_signal((sample_rate * 5.0) as usize);
+        let full = render_frozen_loop(&[signal.clone()], sample_rate, 30.0, 100.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let half = render_frozen_loop(&[signal.clone()], sample_rate, 30.0, 50.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let silent = render_frozen_loop(&[signal], sample_rate, 30.0, 0.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+
+        for ((f, h), s) in full.channels[0].iter().zip(half.channels[0].iter()).zip(silent.channels[0].iter()) {
+            assert!((h - f * 0.5).abs() < 1e-4, "50% volume should exactly halve the rendered output");
+            assert!(s.abs() < 1e-6, "0% volume should render ~silence, got {}", s);
+        }
+    }
+
+    #[test]
     fn always_outputs_exactly_two_channels() {
         let sample_rate = 48000.0;
         let mono_signal = make_test_signal((sample_rate * 5.0) as usize);
-        let mono_result = render_frozen_loop(&[mono_signal], sample_rate, 30.0, 0.0, 40.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let mono_result = render_frozen_loop(&[mono_signal], sample_rate, 30.0, 100.0, 0.0, 40.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
         assert_eq!(mono_result.channels.len(), 2);
         assert_eq!(mono_result.channels[0].len(), mono_result.channels[1].len());
 
         let left = make_test_signal((sample_rate * 5.0) as usize);
         let right: Vec<f32> = left.iter().map(|s| s * 0.5).collect();
-        let stereo_result = render_frozen_loop(&[left, right], sample_rate, 30.0, 0.0, 40.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let stereo_result = render_frozen_loop(&[left, right], sample_rate, 30.0, 100.0, 0.0, 40.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
         assert_eq!(stereo_result.channels.len(), 2);
         assert_eq!(stereo_result.channels[0].len(), stereo_result.channels[1].len());
     }
@@ -362,7 +380,7 @@ mod tests {
         let left = make_test_signal((sample_rate * 5.0) as usize);
         let right: Vec<f32> = left.iter().enumerate().map(|(i, s)| s * 0.3 + (i as f32 * 0.05).sin() * 0.2).collect();
 
-        let result = render_frozen_loop(&[left, right], sample_rate, 30.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let result = render_frozen_loop(&[left, right], sample_rate, 30.0, 100.0, 0.0, 0.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
         for (l, r) in result.channels[0].iter().zip(result.channels[1].iter()) {
             assert!((l - r).abs() < 1e-4, "width=0 must produce identical (centered) L/R even for a stereo source");
         }
@@ -376,7 +394,7 @@ mod tests {
         // (non-trivial) difference between channels even here.
         let sample_rate = 48000.0;
         let mono_signal = make_test_signal((sample_rate * 5.0) as usize);
-        let result = render_frozen_loop(&[mono_signal], sample_rate, 30.0, 0.0, 100.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+        let result = render_frozen_loop(&[mono_signal], sample_rate, 30.0, 100.0, 0.0, 100.0, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
 
         let diff_energy: f32 = result.channels[0]
             .iter()
@@ -398,7 +416,7 @@ mod tests {
         let mono_signal = make_test_signal((sample_rate * 5.0) as usize);
 
         let diff_energy_at = |width: f32| -> f32 {
-            let result = render_frozen_loop(&[mono_signal.clone()], sample_rate, 30.0, 0.0, width, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
+            let result = render_frozen_loop(&[mono_signal.clone()], sample_rate, 30.0, 100.0, 0.0, width, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE);
             result.channels[0]
                 .iter()
                 .zip(result.channels[1].iter())
