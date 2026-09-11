@@ -21,9 +21,6 @@ const NO_NOTE: u8 = 255;
 /// heading and bottom-right corner, and saved into every exported preset,
 /// so it's possible to tell which plugin version made a given sound.
 const BUILD_NUMBER: &str = env!("SPECTRALPRISM_BUILD_NUMBER");
-/// The same build date spelled out ("11 September 2026"), also stamped by
-/// `build.rs` - shown alongside `BUILD_NUMBER` in the editor's heading.
-const BUILD_DATE_HUMAN: &str = env!("SPECTRALPRISM_BUILD_DATE_HUMAN");
 
 /// The loop buffer is baked from a source sample (the built-in placeholder
 /// tone until a real file is loaded via the editor's "Load Sample" button)
@@ -132,13 +129,19 @@ const RENDER_THROTTLE_MS: f32 = 100.0;
 /// until bumped. The `ScrollArea` safety net (see `editor()`) means nothing
 /// is ever actually clipped/lost in the meantime, just not visible without
 /// scrolling.
-/// Widened (800->1040) and shortened (640->560) again for the three-column
-/// layout (Sample A/B + Fusion, Envelope + 5 sliders, remaining 5 sliders) -
-/// splitting the old single 10-slider right column in half needs more
-/// horizontal room per column to stay legible, but reclaims roughly that
-/// same amount of vertical space back.
-const BASE_EDITOR_WIDTH: u32 = 1040;
-const BASE_EDITOR_HEIGHT: u32 = 560;
+/// Narrowed and shortened after moving every label beside its slider (one
+/// row instead of two, via `egui::Grid` - see `param_row`) and moving the
+/// MIDI diagnostic line into the bottom status bar - both freed up enough
+/// space that the previous three-column-era size (1040x560) left a large
+/// empty gap below the content. Height bumped again once Sample B's
+/// waveform/Freeze Point/Formant Shift became always-visible (greyed out
+/// rather than hidden when Off - see the Sample B block in `editor()`) so
+/// the left column's height (and thus the window) no longer depends on
+/// which Fusion mode is selected. Each size re-measured directly against a
+/// screenshot of the actual rendered content at `DEFAULT_SCALE` rather than
+/// guessed.
+const BASE_EDITOR_WIDTH: u32 = 950;
+const BASE_EDITOR_HEIGHT: u32 = 545;
 /// The editor opens at this multiple of the base size by default (matching
 /// `apply_gui_scale`'s scale factor, since the two are computed from the
 /// same base) - requested directly ("too small to read" at 1x, then a
@@ -149,8 +152,10 @@ const DEFAULT_SCALE: f32 = 1.875;
 /// Shared by `draw_freeze_point_waveform` and `draw_adsr_graph` so the two
 /// side-by-side graph boxes always line up at the same height, regardless
 /// of scale - requested directly after the ADSR graph's own (taller) 90.0
-/// default made the two columns visibly mismatched.
-const GRAPH_HEIGHT: f32 = 70.0;
+/// default made the two columns visibly mismatched. Trimmed from 70.0 as
+/// part of reclaiming vertical space across the editor - both graphs are
+/// informational, not primary controls, so a bit shorter still reads fine.
+const GRAPH_HEIGHT: f32 = 55.0;
 
 /// Fixed height (1x-scale points, multiplied by `scale` like everything
 /// else) for the Spectral Fusion info box, so its position - right above
@@ -234,7 +239,13 @@ fn apply_theme(ctx: &egui::Context) {
         v.warn_fg_color = COLOR_ACCENT;
         v.hyperlink_color = COLOR_ACCENT;
         v.selection.bg_fill = COLOR_ACCENT;
-        v.selection.stroke = egui::Stroke::new(1.0, COLOR_ACCENT);
+        // Dark ink, not the accent color itself - same reasoning as
+        // `widgets.active.fg_stroke` below: the accent fill is bright
+        // enough that same-color (or white) text on top of it is
+        // unreadable. This is what makes a `selectable_label` (e.g. the
+        // Preset Browser's tree) show its text once selected instead of
+        // just a solid color swatch.
+        v.selection.stroke = egui::Stroke::new(1.0, COLOR_INK);
 
         v.widgets.noninteractive.bg_fill = COLOR_PANEL;
         v.widgets.noninteractive.weak_bg_fill = COLOR_PANEL;
@@ -931,6 +942,28 @@ struct Preset {
     /// loaded when this preset was saved.
     #[serde(default)]
     sample_path_b: Option<PathBuf>,
+    /// Browsable/sortable metadata, entered via the Save dialog - see
+    /// `PrismEditorState::show_save_dialog`. `#[serde(default)]` (empty
+    /// strings) for presets saved before the Preset Browser existed; the
+    /// browser and info panel treat an empty `category`/`sub_category` as
+    /// "Uncategorized" rather than a blank tree node. `title` defaults to
+    /// the on-disk preset name itself when empty, so older presets still
+    /// display something meaningful.
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    sub_category: String,
+    /// YYYY-MM-DD, set to `today_utc_date()` every time this preset is
+    /// saved via the Save dialog - distinct from `build_number` (which
+    /// plugin *version* made it) and computed at runtime, not compile time.
+    /// `#[serde(default)]` (empty, displayed as "unknown") for presets
+    /// saved before this existed.
+    #[serde(default)]
+    date_last_updated: String,
 }
 
 fn default_loop_length_seconds() -> f32 {
@@ -980,8 +1013,49 @@ impl Preset {
             fusion_convolve_amount_pct: params.fusion_convolve_amount.value(),
             fusion_ring_mod_amount_pct: params.fusion_ring_mod_amount.value(),
             sample_path_b: params.sample_path_b.lock().unwrap().clone(),
+            // Not tied to any param - left blank here; the Save dialog
+            // (the only place that actually writes a named library preset
+            // to disk) fills these in on the `Preset` this returns before
+            // calling `save_preset`.
+            title: String::new(),
+            author: String::new(),
+            category: String::new(),
+            sub_category: String::new(),
+            date_last_updated: String::new(),
         }
     }
+}
+
+/// Today's date (UTC) as YYYY-MM-DD, for `Preset::date_last_updated`.
+/// Computed from the system clock in plain Rust rather than shelling out to
+/// `date` (unlike `build.rs`, which only ever runs once at compile time on
+/// a build machine) - this runs at runtime, potentially every time a preset
+/// is saved, from inside a plugin hosted in a DAW, where spawning a
+/// subprocess on every save is a needless dependency on an external binary
+/// being on `PATH` in whatever environment the host provides.
+fn today_utc_date() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Howard Hinnant's `civil_from_days` algorithm (public domain) - converts
+/// a day count since the Unix epoch (1970-01-01) into a proleptic
+/// Gregorian (year, month, day). The standard small, dependency-free way to
+/// do this conversion without a date/time crate; see
+/// <https://howardhinnant.github.io/date_algorithms.html>.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 /// Presets live in a per-user directory rather than next to the plugin
@@ -1059,8 +1133,70 @@ fn load_preset(dir: &Path, name: &str) -> Result<Preset, String> {
 #[derive(Default)]
 struct PrismEditorState {
     error: Option<String>,
-    /// Text field buffer for naming a new preset to save.
+    /// Text field buffer for naming a new preset to save - also doubles as
+    /// the Save dialog's prefilled Title.
     preset_name_input: String,
+    /// Whether the Save dialog (Title/Author/Category/Sub-category) is
+    /// currently open - opened by clicking "Save", closed by its own
+    /// Save/Cancel buttons or backdrop click/Escape (`egui::Modal`).
+    show_save_dialog: bool,
+    save_title_input: String,
+    save_author_input: String,
+    save_category_input: String,
+    save_subcategory_input: String,
+    /// Whether the Preset Browser modal is currently open.
+    show_preset_browser: bool,
+    /// Live search text, filtering the browser's Category/Sub-category/
+    /// Preset tree by title/author substring match.
+    preset_browser_search: String,
+    /// Every named on-disk preset's browsable metadata - loaded once when
+    /// the browser is opened (not re-read from disk every frame it's open).
+    preset_browser_entries: Vec<PresetBrowserEntry>,
+    /// Which preset (by its on-disk name, i.e. `PresetBrowserEntry::name`)
+    /// is currently highlighted in the browser's tree, if any - drives the
+    /// info panel at the bottom of the modal. Distinct from actually
+    /// loading it, which only happens when "Load" is clicked.
+    preset_browser_selected: Option<String>,
+}
+
+/// One preset's worth of metadata for the Preset Browser's tree/search/info
+/// panel, read once per preset file when the browser opens - see
+/// `load_preset_browser_entries`. `name` is the on-disk file stem (what
+/// `load_preset`/`save_preset` key on); the rest mirror the matching
+/// `Preset` fields.
+#[derive(Clone)]
+struct PresetBrowserEntry {
+    name: String,
+    title: String,
+    author: String,
+    category: String,
+    sub_category: String,
+}
+
+/// Reads every named on-disk preset's metadata from `dir` - used to
+/// populate the Preset Browser's tree when it opens. A preset file that
+/// fails to parse (corrupted, or some other unrelated `.spjson` file) is
+/// silently skipped rather than blocking the whole browser on one bad file.
+fn load_preset_browser_entries(dir: &Path) -> Vec<PresetBrowserEntry> {
+    list_presets(dir)
+        .into_iter()
+        .filter_map(|name| {
+            let preset = load_preset(dir, &name).ok()?;
+            let title = if preset.title.is_empty() { name.clone() } else { preset.title };
+            Some(PresetBrowserEntry { name, title, author: preset.author, category: preset.category, sub_category: preset.sub_category })
+        })
+        .collect()
+}
+
+/// `category`/`sub_category` as they should actually be displayed/grouped
+/// in the Preset Browser's tree - an empty string becomes "Uncategorized"
+/// rather than a blank, easy-to-miss tree node.
+fn display_category(category: &str) -> &str {
+    if category.is_empty() {
+        "Uncategorized"
+    } else {
+        category
+    }
 }
 
 /// Multiplies built-in text sizes and interactive-widget spacing by `scale`,
@@ -1104,6 +1240,18 @@ fn apply_gui_scale(ctx: &egui::Context, scale: f32) {
 /// once this has claimed its own space) automatically ends up narrower by
 /// exactly this much, no manual arithmetic needed at the call site.
 const VOLUME_SLIDER_WIDTH: f32 = 28.0;
+
+/// One "label | slider" row inside an `egui::Grid` - the label goes in the
+/// grid's first column (sized to whichever label in that grid is widest)
+/// and the slider in the second (so every slider in the same grid starts
+/// at the same x, not just sits below its own label), then advances to the
+/// next row. Callers still need their own `egui::Grid::new(...).show(ui,
+/// |ui| { ... })` around a run of these - this only draws one row's worth.
+fn param_row(ui: &mut egui::Ui, label: &str, param: &FloatParam, setter: &ParamSetter) {
+    ui.label(label);
+    ui.add(widgets::ParamSlider::for_param(param, setter));
+    ui.end_row();
+}
 
 /// A vertical fader for a sample's Volume, meant to sit directly to the
 /// left of that sample's `draw_freeze_point_waveform` (`nih_plug_egui`'s
@@ -1551,13 +1699,37 @@ impl Plugin for PrismPlugin {
                 // fixed in the corner regardless of the content's own
                 // scroll position, rather than just being the last thing in
                 // the scrollable area.
-                egui::TopBottomPanel::bottom("spectral_prism_build_number")
-                    .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric((6.0 * scale) as i8, (3.0 * scale) as i8)))
+                // The build number now only lives in the heading
+                // ("SpectralPrism | v{BUILD_NUMBER}") - showing it here too
+                // was redundant. The freed-up right side of this strip is
+                // reserved for something else later.
+                egui::TopBottomPanel::bottom("spectral_prism_status_bar")
+                    .frame(
+                        egui::Frame::default()
+                            // `Frame::default()` has no fill of its own, so
+                            // without this it falls through to the raw
+                            // (black) clear color behind the whole window
+                            // instead of the theme's background - this is
+                            // what made the strip unreadable (light-grey
+                            // text on black instead of on the theme's own
+                            // surface color).
+                            .fill(COLOR_SURFACE_DEEP)
+                            .inner_margin(egui::Margin::symmetric((6.0 * scale) as i8, (3.0 * scale) as i8)),
+                    )
                     .show_separator_line(false)
                     .show(egui_ctx, |ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(format!("Build {BUILD_NUMBER}")).small().color(COLOR_DIM));
-                        });
+                        // Diagnostic, not something being adjusted - moved
+                        // here (out of the scrollable content area) so it
+                        // doesn't cost a full-width row up top and stays
+                        // visible regardless of scroll position.
+                        let note = last_note.load(Ordering::Relaxed);
+                        let voice_count = active_voice_count.load(Ordering::Relaxed);
+                        let note_label = if note == NO_NOTE { "--".to_string() } else { note.to_string() };
+                        // COLOR_INK (dark charcoal), not COLOR_DIM - this
+                        // strip has its own light background rather than
+                        // sharing the main content's white, so it needs the
+                        // stronger of the two text colors to stay legible.
+                        ui.label(egui::RichText::new(format!("MIDI: note {note_label} | {voice_count} voice(s) active")).small().color(COLOR_INK));
                     });
 
                 ResizableWindow::new("spectral_prism_window")
@@ -1565,7 +1737,7 @@ impl Plugin for PrismPlugin {
                     .show(egui_ctx, &params.editor_state, |ui| {
                         egui::Frame::default().inner_margin(egui::Margin::same((EDITOR_MARGIN * scale) as i8)).show(ui, |ui| {
                         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        ui.heading(format!("SpectralPrism | v{BUILD_NUMBER} (for {BUILD_DATE_HUMAN})"));
+                        ui.heading(format!("SpectralPrism | v{BUILD_NUMBER}"));
 
                         let presets_dir = presets_dir();
                         let preset_names = presets_dir.as_deref().map(list_presets).unwrap_or_default();
@@ -1623,17 +1795,16 @@ impl Plugin for PrismPlugin {
                                 let idx = current_preset_idx.map(|i| i.saturating_sub(1)).unwrap_or(0);
                                 load_preset_at(idx, state);
                             }
+                            // Opens the Preset Browser modal instead of a
+                            // plain dropdown - still shows the current
+                            // preset's name, just as a button.
                             let combo_label = selected_preset_name.as_deref().unwrap_or("(no preset)");
-                            egui::ComboBox::from_id_salt("spectral_prism_preset_combo").selected_text(combo_label).show_ui(
-                                ui,
-                                |ui| {
-                                    for (idx, name) in preset_names.iter().enumerate() {
-                                        if ui.selectable_label(current_preset_idx == Some(idx), name).clicked() {
-                                            load_preset_at(idx, state);
-                                        }
-                                    }
-                                },
-                            );
+                            if ui.button(combo_label).clicked() {
+                                state.preset_browser_entries = presets_dir.as_deref().map(load_preset_browser_entries).unwrap_or_default();
+                                state.preset_browser_search.clear();
+                                state.preset_browser_selected = selected_preset_name.clone();
+                                state.show_preset_browser = true;
+                            }
                             if ui.add_enabled(!preset_names.is_empty(), egui::Button::new("▶")).clicked() {
                                 let idx = current_preset_idx
                                     .map(|i| (i + 1).min(preset_names.len() - 1))
@@ -1649,17 +1820,21 @@ impl Plugin for PrismPlugin {
                                     .desired_width(140.0 * scale),
                             );
                             let name = state.preset_name_input.trim().to_string();
+                            // Opens the Save dialog (Title/Author/Category/
+                            // Sub-category) instead of saving immediately -
+                            // prefilled from the currently-loaded preset's
+                            // own metadata when re-saving over it, or blank
+                            // for a brand new one.
                             if ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() {
-                                match &presets_dir {
-                                    Some(dir) => match save_preset(dir, &name, &Preset::capture(&params)) {
-                                        Ok(()) => {
-                                            *params.selected_preset.lock().unwrap() = Some(name);
-                                            state.error = None;
-                                        }
-                                        Err(e) => state.error = Some(e),
-                                    },
-                                    None => state.error = Some("couldn't find a presets directory ($HOME not set?)".to_string()),
-                                }
+                                let existing = selected_preset_name
+                                    .as_ref()
+                                    .filter(|selected| selected.as_str() == name)
+                                    .and_then(|selected| presets_dir.as_deref().and_then(|dir| load_preset(dir, selected).ok()));
+                                state.save_title_input = name.clone();
+                                state.save_author_input = existing.as_ref().map(|p| p.author.clone()).unwrap_or_default();
+                                state.save_category_input = existing.as_ref().map(|p| p.category.clone()).unwrap_or_default();
+                                state.save_subcategory_input = existing.as_ref().map(|p| p.sub_category.clone()).unwrap_or_default();
+                                state.show_save_dialog = true;
                             }
 
                             ui.separator();
@@ -1724,10 +1899,170 @@ impl Plugin for PrismPlugin {
                             }
                         });
 
-                        let note = last_note.load(Ordering::Relaxed);
-                        let voice_count = active_voice_count.load(Ordering::Relaxed);
-                        let note_label = if note == NO_NOTE { "--".to_string() } else { note.to_string() };
-                        ui.colored_label(COLOR_DIM, format!("MIDI: note {note_label} | {voice_count} voice(s) active"));
+                        if state.show_save_dialog {
+                            let modal = egui::Modal::new(egui::Id::new("spectral_prism_save_modal")).show(egui_ctx, |ui| {
+                                ui.set_min_width(320.0 * scale);
+                                ui.heading("Save Preset");
+                                ui.add_space(4.0);
+                                egui::Grid::new("spectral_prism_save_modal_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(
+                                    ui,
+                                    |ui| {
+                                        ui.label("Title");
+                                        ui.text_edit_singleline(&mut state.save_title_input);
+                                        ui.end_row();
+                                        ui.label("Author");
+                                        ui.text_edit_singleline(&mut state.save_author_input);
+                                        ui.end_row();
+                                        ui.label("Category");
+                                        ui.text_edit_singleline(&mut state.save_category_input);
+                                        ui.end_row();
+                                        ui.label("Sub-category");
+                                        ui.text_edit_singleline(&mut state.save_subcategory_input);
+                                        ui.end_row();
+                                    },
+                                );
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let title = state.save_title_input.trim().to_string();
+                                    if ui.add_enabled(!title.is_empty(), egui::Button::new("Save")).clicked() {
+                                        match &presets_dir {
+                                            Some(dir) => {
+                                                let mut preset = Preset::capture(&params);
+                                                preset.title = title.clone();
+                                                preset.author = state.save_author_input.trim().to_string();
+                                                preset.category = state.save_category_input.trim().to_string();
+                                                preset.sub_category = state.save_subcategory_input.trim().to_string();
+                                                preset.date_last_updated = today_utc_date();
+                                                match save_preset(dir, &title, &preset) {
+                                                    Ok(()) => {
+                                                        *params.selected_preset.lock().unwrap() = Some(title.clone());
+                                                        state.preset_name_input = title;
+                                                        state.error = None;
+                                                        state.show_save_dialog = false;
+                                                    }
+                                                    Err(e) => state.error = Some(e),
+                                                }
+                                            }
+                                            None => state.error = Some("couldn't find a presets directory ($HOME not set?)".to_string()),
+                                        }
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        state.show_save_dialog = false;
+                                    }
+                                });
+                            });
+                            if modal.should_close() {
+                                state.show_save_dialog = false;
+                            }
+                        }
+
+                        if state.show_preset_browser {
+                            let modal = egui::Modal::new(egui::Id::new("spectral_prism_preset_browser")).show(egui_ctx, |ui| {
+                                ui.set_min_width(520.0 * scale);
+                                ui.heading("Preset Browser");
+                                ui.add_space(4.0);
+                                ui.add(egui::TextEdit::singleline(&mut state.preset_browser_search).hint_text("Search by title or author..."));
+                                ui.add_space(4.0);
+
+                                let search = state.preset_browser_search.trim().to_lowercase();
+                                let mut by_category: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<&PresetBrowserEntry>>> =
+                                    Default::default();
+                                for entry in &state.preset_browser_entries {
+                                    if !search.is_empty()
+                                        && !entry.title.to_lowercase().contains(&search)
+                                        && !entry.author.to_lowercase().contains(&search)
+                                    {
+                                        continue;
+                                    }
+                                    by_category
+                                        .entry(display_category(&entry.category).to_string())
+                                        .or_default()
+                                        .entry(display_category(&entry.sub_category).to_string())
+                                        .or_default()
+                                        .push(entry);
+                                }
+
+                                egui::ScrollArea::vertical().max_height(240.0 * scale).show(ui, |ui| {
+                                    if by_category.is_empty() {
+                                        ui.colored_label(COLOR_DIM, "No presets found.");
+                                    }
+                                    for (category, sub_categories) in &by_category {
+                                        egui::CollapsingHeader::new(category).default_open(true).show(ui, |ui| {
+                                            for (sub_category, entries) in sub_categories {
+                                                egui::CollapsingHeader::new(sub_category).default_open(true).show(ui, |ui| {
+                                                    for entry in entries {
+                                                        let is_selected = state.preset_browser_selected.as_deref() == Some(entry.name.as_str());
+                                                        if ui.selectable_label(is_selected, &entry.title).clicked() {
+                                                            state.preset_browser_selected = Some(entry.name.clone());
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+
+                                ui.separator();
+                                let selected_entry = state
+                                    .preset_browser_selected
+                                    .as_deref()
+                                    .and_then(|name| presets_dir.as_deref().and_then(|dir| load_preset(dir, name).ok()));
+                                match &selected_entry {
+                                    Some(preset) => {
+                                        let sample_a_name = preset
+                                            .sample_path
+                                            .as_ref()
+                                            .and_then(|p| p.file_name())
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "(none)".to_string());
+                                        let sample_b_name = preset
+                                            .sample_path_b
+                                            .as_ref()
+                                            .and_then(|p| p.file_name())
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "(none)".to_string());
+                                        let algorithm = FusionMode::from_preset_id(&preset.fusion_mode);
+                                        let title = if preset.title.is_empty() { "(untitled)" } else { &preset.title };
+                                        let author = if preset.author.is_empty() { "-" } else { &preset.author };
+                                        let build = if preset.build_number.is_empty() { "unknown" } else { &preset.build_number };
+                                        let updated = if preset.date_last_updated.is_empty() { "unknown" } else { &preset.date_last_updated };
+                                        ui.colored_label(COLOR_DIM, format!("Title: {title}    Author: {author}"));
+                                        ui.colored_label(
+                                            COLOR_DIM,
+                                            format!("Category: {} / {}", display_category(&preset.category), display_category(&preset.sub_category)),
+                                        );
+                                        ui.colored_label(COLOR_DIM, format!("Sample A: {sample_a_name}    Sample B: {sample_b_name}"));
+                                        ui.colored_label(
+                                            COLOR_DIM,
+                                            format!("Algorithm: {}", FusionMode::variants()[algorithm.to_index()]),
+                                        );
+                                        ui.colored_label(COLOR_DIM, format!("Build: {build}    Last updated: {updated}"));
+                                    }
+                                    None => {
+                                        ui.colored_label(COLOR_DIM, "Select a preset above to see its details.");
+                                    }
+                                }
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let can_load = state.preset_browser_selected.is_some();
+                                    if ui.add_enabled(can_load, egui::Button::new("Load")).clicked() {
+                                        if let Some(name) = state.preset_browser_selected.clone() {
+                                            if let Some(idx) = preset_names.iter().position(|n| n == &name) {
+                                                load_preset_at(idx, state);
+                                            }
+                                        }
+                                        state.show_preset_browser = false;
+                                    }
+                                    if ui.button("Close").clicked() {
+                                        state.show_preset_browser = false;
+                                    }
+                                });
+                            });
+                            if modal.should_close() {
+                                state.show_preset_browser = false;
+                            }
+                        }
 
                         ui.add_space(8.0);
 
@@ -1748,79 +2083,97 @@ impl Plugin for PrismPlugin {
                             if clicked_load_a {
                                 open_sample_dialog(state);
                             }
-                            left.label("Freeze Point");
-                            left.add(widgets::ParamSlider::for_param(&params.freeze_point, setter));
 
-                            left.label("Formant Shift");
-                            left.add(widgets::ParamSlider::for_param(&params.formant_shift, setter));
-
-                            left.add_space(8.0);
-                            left.label("Spectral Fusion");
                             let current_fusion = params.fusion_mode.value();
-                            egui::ComboBox::from_id_salt("spectral_prism_fusion_combo")
-                                .selected_text(FusionMode::variants()[current_fusion.to_index()])
-                                .show_ui(left, |ui| {
-                                    for idx in 0..FusionMode::variants().len() {
-                                        let variant = FusionMode::from_index(idx);
-                                        if ui.selectable_label(current_fusion == variant, FusionMode::variants()[idx]).clicked() {
-                                            setter.begin_set_parameter(&params.fusion_mode);
-                                            setter.set_parameter(&params.fusion_mode, variant);
-                                            setter.end_set_parameter(&params.fusion_mode);
+                            egui::Grid::new("spectral_prism_sample_a_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(left, |ui| {
+                                param_row(ui, "Freeze Point", &params.freeze_point, setter);
+                                param_row(ui, "Formant Shift", &params.formant_shift, setter);
+
+                                ui.label("Spectral Fusion");
+                                egui::ComboBox::from_id_salt("spectral_prism_fusion_combo")
+                                    .selected_text(FusionMode::variants()[current_fusion.to_index()])
+                                    .show_ui(ui, |ui| {
+                                        for idx in 0..FusionMode::variants().len() {
+                                            let variant = FusionMode::from_index(idx);
+                                            if ui.selectable_label(current_fusion == variant, FusionMode::variants()[idx]).clicked() {
+                                                setter.begin_set_parameter(&params.fusion_mode);
+                                                setter.set_parameter(&params.fusion_mode, variant);
+                                                setter.end_set_parameter(&params.fusion_mode);
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                ui.end_row();
+                            });
 
-                            if current_fusion != FusionMode::Off {
-                                left.add_space(8.0);
-                                left.label("Sample B");
-                                let has_loaded_sample_b = loaded_filename_b.load().is_some();
-                                let clicked_load_b = left
-                                    .horizontal(|ui| {
-                                        draw_vertical_volume_slider(ui, &params.sample_b_volume, setter, GRAPH_HEIGHT * scale, scale);
-                                        draw_freeze_point_waveform(
-                                            ui,
-                                            &source_b,
-                                            &params.freeze_point_b,
-                                            params.sample_b_volume.value(),
-                                            setter,
-                                            has_loaded_sample_b,
-                                            scale,
-                                        )
-                                    })
-                                    .inner;
-                                if clicked_load_b {
-                                    open_sample_dialog_b(state);
-                                }
-                                left.label("Freeze Point");
-                                left.add(widgets::ParamSlider::for_param(&params.freeze_point_b, setter));
+                            // Always rendered (not just while a Fusion mode
+                            // needing Sample B is selected) and only greyed
+                            // out/non-interactive when Off, via
+                            // `add_enabled_ui` - so the left column's total
+                            // height stays the same across every mode,
+                            // which is what lets the default window size
+                            // (below) actually fit every state without
+                            // needing to grow for Fusion controls. The
+                            // Amount row and the "needs Sample B" line are
+                            // both still reserved (as a blank row/label)
+                            // even when not applicable, for the same reason.
+                            left.add_space(8.0);
+                            let has_loaded_sample_b = loaded_filename_b.load().is_some();
+                            let clicked_load_b = left
+                                .add_enabled_ui(current_fusion != FusionMode::Off, |ui| {
+                                    ui.label("Sample B");
+                                    let clicked = ui
+                                        .horizontal(|ui| {
+                                            draw_vertical_volume_slider(ui, &params.sample_b_volume, setter, GRAPH_HEIGHT * scale, scale);
+                                            draw_freeze_point_waveform(
+                                                ui,
+                                                &source_b,
+                                                &params.freeze_point_b,
+                                                params.sample_b_volume.value(),
+                                                setter,
+                                                has_loaded_sample_b,
+                                                scale,
+                                            )
+                                        })
+                                        .inner;
 
-                                left.label("Formant Shift");
-                                left.add(widgets::ParamSlider::for_param(&params.formant_shift_b, setter));
+                                    egui::Grid::new("spectral_prism_sample_b_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(
+                                        ui,
+                                        |ui| {
+                                            param_row(ui, "Freeze Point", &params.freeze_point_b, setter);
+                                            param_row(ui, "Formant Shift", &params.formant_shift_b, setter);
+                                            match current_fusion {
+                                                FusionMode::Mix => param_row(ui, "Mix Blend (A \u{2194} B)", &params.fusion_mix_amount, setter),
+                                                FusionMode::CrossSynth => {
+                                                    param_row(ui, "Cross-Synth Amount", &params.fusion_cross_synth_amount, setter)
+                                                }
+                                                FusionMode::Convolve => param_row(ui, "Convolve Amount", &params.fusion_convolve_amount, setter),
+                                                FusionMode::RingModulate => {
+                                                    param_row(ui, "Ring Mod Amount", &params.fusion_ring_mod_amount, setter)
+                                                }
+                                                // No Amount control for this mode - an empty row reserves
+                                                // the same height anyway, so the grid (and everything
+                                                // below it) doesn't shift between modes.
+                                                _ => {
+                                                    ui.label("");
+                                                    ui.label("");
+                                                    ui.end_row();
+                                                }
+                                            }
+                                        },
+                                    );
 
-                                match current_fusion {
-                                    FusionMode::Mix => {
-                                        left.label("Mix Blend (A \u{2194} B)");
-                                        left.add(widgets::ParamSlider::for_param(&params.fusion_mix_amount, setter));
-                                    }
-                                    FusionMode::CrossSynth => {
-                                        left.label("Cross-Synth Amount");
-                                        left.add(widgets::ParamSlider::for_param(&params.fusion_cross_synth_amount, setter));
-                                    }
-                                    FusionMode::Convolve => {
-                                        left.label("Convolve Amount");
-                                        left.add(widgets::ParamSlider::for_param(&params.fusion_convolve_amount, setter));
-                                    }
-                                    FusionMode::RingModulate => {
-                                        left.label("Ring Mod Amount");
-                                        left.add(widgets::ParamSlider::for_param(&params.fusion_ring_mod_amount, setter));
-                                    }
-                                    _ => {}
-                                }
+                                    clicked
+                                })
+                                .inner;
+                            if clicked_load_b {
+                                open_sample_dialog_b(state);
+                            }
 
-                                if !has_loaded_sample_b && current_fusion.needs_sample_b() {
-                                    left.add_space(4.0);
-                                    left.colored_label(COLOR_ERROR, "This mode needs Sample B - load one above to hear it.");
-                                }
+                            left.add_space(4.0);
+                            if !has_loaded_sample_b && current_fusion.needs_sample_b() {
+                                left.colored_label(COLOR_ERROR, "This mode needs Sample B - load one above to hear it.");
+                            } else {
+                                left.label("");
                             }
 
                             // Envelope + its 5 sliders in the middle column,
@@ -1828,38 +2181,28 @@ impl Plugin for PrismPlugin {
                             // Pan Width) in the right column - splitting
                             // what used to be one 10-slider column in half
                             // so the window grows wider instead of taller.
+                            // Each column's rows share one `egui::Grid` so
+                            // every label lines up to the same width and
+                            // every slider starts at the same x.
                             let middle = &mut columns[1];
                             middle.label("Envelope (Attack / Decay / Sustain / Release)");
                             draw_adsr_graph(middle, &params.attack, &params.decay, &params.sustain, &params.release, setter, scale);
-                            middle.label("Attack");
-                            middle.add(widgets::ParamSlider::for_param(&params.attack, setter));
-                            middle.label("Decay");
-                            middle.add(widgets::ParamSlider::for_param(&params.decay, setter));
-                            middle.label("Sustain");
-                            middle.add(widgets::ParamSlider::for_param(&params.sustain, setter));
-                            middle.label("Release");
-                            middle.add(widgets::ParamSlider::for_param(&params.release, setter));
-
-                            middle.add_space(8.0);
-                            middle.label("Velocity Sensitivity");
-                            middle.add(widgets::ParamSlider::for_param(&params.velocity_sensitivity, setter));
+                            egui::Grid::new("spectral_prism_envelope_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(middle, |ui| {
+                                param_row(ui, "Attack", &params.attack, setter);
+                                param_row(ui, "Decay", &params.decay, setter);
+                                param_row(ui, "Sustain", &params.sustain, setter);
+                                param_row(ui, "Release", &params.release, setter);
+                                param_row(ui, "Velocity Sensitivity", &params.velocity_sensitivity, setter);
+                            });
 
                             let right = &mut columns[2];
-                            right.label("Stereo Width");
-                            right.add(widgets::ParamSlider::for_param(&params.stereo_width, setter));
-
-                            right.label("Loop Length");
-                            right.add(widgets::ParamSlider::for_param(&params.loop_length_seconds, setter));
-
-                            right.add_space(8.0);
-                            right.label("Pitch Bend Range");
-                            right.add(widgets::ParamSlider::for_param(&params.pitch_bend_range_semitones, setter));
-
-                            right.add_space(8.0);
-                            right.label("Pan Center");
-                            right.add(widgets::ParamSlider::for_param(&params.pan_center_pct, setter));
-                            right.label("Random Pan Width");
-                            right.add(widgets::ParamSlider::for_param(&params.pan_width_pct, setter));
+                            egui::Grid::new("spectral_prism_right_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(right, |ui| {
+                                param_row(ui, "Stereo Width", &params.stereo_width, setter);
+                                param_row(ui, "Loop Length", &params.loop_length_seconds, setter);
+                                param_row(ui, "Pitch Bend Range", &params.pitch_bend_range_semitones, setter);
+                                param_row(ui, "Pan Center", &params.pan_center_pct, setter);
+                                param_row(ui, "Random Pan Width", &params.pan_width_pct, setter);
+                            });
                         });
 
                         // Always visible (even in Off mode, describing plain
@@ -2133,6 +2476,34 @@ nih_export_clap!(PrismPlugin);
 nih_export_vst3!(PrismPlugin);
 
 #[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_matches_known_reference_dates() {
+        // Unix epoch itself.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // A pre-epoch date (negative day count) - exercises the `era`
+        // branch's negative-side rounding.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        // A leap-year February 29th.
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        // The date this feature was actually built on, cross-checked
+        // against the real calendar by hand.
+        assert_eq!(civil_from_days(20_707), (2026, 9, 11));
+    }
+
+    #[test]
+    fn today_utc_date_matches_yyyy_mm_dd_shape() {
+        let date = today_utc_date();
+        assert_eq!(date.len(), 10, "expected YYYY-MM-DD, got {date:?}");
+        assert_eq!(date.as_bytes()[4], b'-');
+        assert_eq!(date.as_bytes()[7], b'-');
+        assert!(date.chars().enumerate().all(|(i, c)| (i == 4 || i == 7) || c.is_ascii_digit()));
+    }
+}
+
+#[cfg(test)]
 mod preset_tests {
     use super::*;
 
@@ -2176,6 +2547,11 @@ mod preset_tests {
             fusion_convolve_amount_pct: 90.0,
             fusion_ring_mod_amount_pct: 70.0,
             sample_path_b: Some(PathBuf::from("/some/sample-b.wav")),
+            title: "My Test Preset".to_string(),
+            author: "Test Author".to_string(),
+            category: "Pads".to_string(),
+            sub_category: "Evolving".to_string(),
+            date_last_updated: "2026-09-11".to_string(),
         }
     }
 
@@ -2209,6 +2585,11 @@ mod preset_tests {
         assert_eq!(restored.fusion_convolve_amount_pct, original.fusion_convolve_amount_pct);
         assert_eq!(restored.fusion_ring_mod_amount_pct, original.fusion_ring_mod_amount_pct);
         assert_eq!(restored.sample_path_b, original.sample_path_b);
+        assert_eq!(restored.title, original.title);
+        assert_eq!(restored.author, original.author);
+        assert_eq!(restored.category, original.category);
+        assert_eq!(restored.sub_category, original.sub_category);
+        assert_eq!(restored.date_last_updated, original.date_last_updated);
     }
 
     #[test]
@@ -2241,6 +2622,11 @@ mod preset_tests {
         assert_eq!(restored.fusion_convolve_amount_pct, 100.0);
         assert_eq!(restored.fusion_ring_mod_amount_pct, 100.0);
         assert_eq!(restored.sample_path_b, None);
+        assert_eq!(restored.title, "");
+        assert_eq!(restored.author, "");
+        assert_eq!(restored.category, "");
+        assert_eq!(restored.sub_category, "");
+        assert_eq!(restored.date_last_updated, "");
     }
 
     #[test]

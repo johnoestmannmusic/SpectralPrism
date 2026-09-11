@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/prism_dsp", "crates/prism_cli", "crates/prism_plugin", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "2026.9.11"
 edition = "2021"
 
 # nih-plug is not published on crates.io - pinned to a specific commit so the
