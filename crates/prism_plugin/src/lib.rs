@@ -420,6 +420,22 @@ struct PrismPluginParams {
     #[persist = "selected-preset"]
     selected_preset: Mutex<Option<String>>,
 
+    /// Mirrors the editor's typable "Preset name..." field
+    /// (`PrismEditorState::preset_name_input`) so its live contents -
+    /// whatever's currently typed, whether or not it's been saved yet -
+    /// survive a host project reload. `PrismEditorState` itself is
+    /// GUI-local and rebuilt fresh every time the editor is (re)opened
+    /// (see its own doc comment), so without a persisted copy to
+    /// initialize from, that field would always come back blank on
+    /// reload even though `selected_preset` above restores the combo
+    /// button's own label correctly - they're two different pieces of
+    /// state read by two different widgets. Synced from the editor's
+    /// field every frame (cheap - one `String` clone into a `Mutex`),
+    /// not just on save, so a name that's been typed but not yet saved
+    /// also survives a reload.
+    #[persist = "preset-name-input"]
+    preset_name_input: Mutex<String>,
+
     /// Sample B's loaded file path, if any - mirrors `sample_path` above for
     /// the same reason (survives a host project save/reload and preset
     /// recall). `None` until the user loads a Sample B; unlike `sample_path`
@@ -576,6 +592,7 @@ impl Default for PrismPluginParams {
             ),
             sample_path: Mutex::new(None),
             selected_preset: Mutex::new(None),
+            preset_name_input: Mutex::new(String::new()),
             sample_path_b: Mutex::new(None),
             freeze_point: FloatParam::new("Freeze Point", 50.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
@@ -1281,6 +1298,17 @@ fn display_category(category: &str) -> &str {
     }
 }
 
+/// Every distinct, non-empty value already used for one metadata field
+/// across every on-disk preset, sorted - powers the Save dialog's
+/// "pick from existing" dropdown for Title/Author/Category/Sub-category,
+/// alongside just typing a new value directly into the text field.
+fn distinct_preset_values<'a>(entries: &'a [PresetBrowserEntry], field: impl Fn(&'a PresetBrowserEntry) -> &'a str) -> Vec<String> {
+    let mut values: Vec<String> = entries.iter().map(field).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
 /// Multiplies built-in text sizes and interactive-widget spacing by `scale`,
 /// so dragging `ResizableWindow`'s corner (see `editor()` below) genuinely
 /// makes buttons/sliders/labels bigger too, not just the custom-drawn
@@ -1645,7 +1673,16 @@ impl Plugin for PrismPlugin {
 
         create_egui_editor(
             self.params.editor_state.clone(),
-            PrismEditorState::default(),
+            PrismEditorState {
+                // `PrismEditorState` itself is purely GUI-local and
+                // rebuilt fresh every time the editor is (re)opened - see
+                // `PrismPluginParams::preset_name_input`'s doc comment for
+                // why this field specifically needs to be seeded from
+                // that persisted mirror here, rather than just starting
+                // blank via `Default::default()`.
+                preset_name_input: self.params.preset_name_input.lock().unwrap().clone(),
+                ..Default::default()
+            },
             |ctx, _state| apply_theme(ctx),
             move |egui_ctx, setter, state| {
                 // GUI scaling: the corner of `ResizableWindow` below lets the
@@ -1685,13 +1722,23 @@ impl Plugin for PrismPlugin {
 
                 // Shared by `apply_preset` for both Sample A and Sample B
                 // when `preset.unload_samples` is set (see that field's doc
-                // comment) - clears the source audio, the persisted sample
-                // path, and the displayed filename, then re-renders so the
-                // (now silent) state actually takes effect immediately.
+                // comment) - clears the persisted sample path and displayed
+                // filename, stores `replacement` as the new source audio,
+                // then re-renders so the change actually takes effect
+                // immediately. `replacement` is a parameter (not always
+                // empty) because Sample A can never safely go fully
+                // empty - `render_fused_loop`/`render_frozen_loop` assume
+                // at least one channel and panic on `Vec::new()` (which
+                // silently kills the background render worker thread,
+                // leaving `loop_buffer` stuck on whatever was last
+                // rendered - exactly `initialize()`'s own reasoning for
+                // always falling back to `synthetic_source` for Sample A
+                // specifically, never for Sample B).
                 let unload_sample = |source: &Arc<ArcSwap<Vec<Vec<f32>>>>,
                                       sample_path_slot: &Mutex<Option<PathBuf>>,
-                                      loaded_filename: &Arc<ArcSwapOption<String>>| {
-                    source.store(Arc::new(Vec::new()));
+                                      loaded_filename: &Arc<ArcSwapOption<String>>,
+                                      replacement: Vec<Vec<f32>>| {
+                    source.store(Arc::new(replacement));
                     *sample_path_slot.lock().unwrap() = None;
                     loaded_filename.store(None);
                     trigger.request_render(current_render_request(&params));
@@ -1779,8 +1826,9 @@ impl Plugin for PrismPlugin {
                     setter.end_set_parameter(&params.fusion_mode);
 
                     if preset.unload_samples {
-                        unload_sample(&source, &params.sample_path, &loaded_filename);
-                        unload_sample(&source_b, &params.sample_path_b, &loaded_filename_b);
+                        let sample_rate = loop_buffer.load().sample_rate;
+                        unload_sample(&source, &params.sample_path, &loaded_filename, vec![synthetic_source(sample_rate, 1.0)]);
+                        unload_sample(&source_b, &params.sample_path_b, &loaded_filename_b, Vec::new());
                         state.error = None;
                         return (None, None);
                     }
@@ -1929,6 +1977,15 @@ impl Plugin for PrismPlugin {
                                     .hint_text("Preset name...")
                                     .desired_width(140.0 * scale),
                             );
+                            // Mirrors the field's live contents into
+                            // persisted state every frame (not just on
+                            // save) - see
+                            // `PrismPluginParams::preset_name_input`'s doc
+                            // comment. Covers every way this field can
+                            // change (typing here, or Prev/Next/Import/
+                            // Save assigning it above/below earlier in
+                            // this same frame) with one sync point.
+                            *params.preset_name_input.lock().unwrap() = state.preset_name_input.clone();
                             let name = state.preset_name_input.trim().to_string();
                             // Opens the Save dialog (Title/Author/Category/
                             // Sub-category) instead of saving immediately -
@@ -2007,6 +2064,117 @@ impl Plugin for PrismPlugin {
                         });
 
                         if state.show_save_dialog {
+                            // Scanned fresh every frame the dialog is open
+                            // (cheap - a handful of small on-disk files) so
+                            // the dropdowns below always reflect the current
+                            // library, including a preset saved moments ago
+                            // in this same session.
+                            let save_dialog_entries = presets_dir.as_deref().map(load_preset_browser_entries).unwrap_or_default();
+                            let existing_titles = distinct_preset_values(&save_dialog_entries, |e| &e.title);
+                            let existing_authors = distinct_preset_values(&save_dialog_entries, |e| &e.author);
+                            let existing_categories = distinct_preset_values(&save_dialog_entries, |e| &e.category);
+                            let existing_subcategories = distinct_preset_values(&save_dialog_entries, |e| &e.sub_category);
+                            // A plain text field (typing = "add a new
+                            // value") plus a small dropdown button listing
+                            // every distinct value already used for this
+                            // field across the on-disk library (already
+                            // alphabetical - `distinct_preset_values`
+                            // sorts) - clicking one overwrites the text
+                            // field with it. Deliberately *not*
+                            // `egui::ComboBox`: its popup always wraps
+                            // content in a fixed-height `ScrollArea`
+                            // (`combo_box.rs`), which for a library with
+                            // more than a handful of entries meant most of
+                            // the list was hidden behind an easy-to-miss
+                            // scrollbar. Built directly on the lower-level
+                            // `egui::popup` primitives `ComboBox` itself
+                            // uses internally instead, so the whole list is
+                            // always visible at once - wrapping into a new
+                            // column every 15 entries rather than scrolling.
+                            const DROPDOWN_COLUMN_HEIGHT: usize = 15;
+                            let field_with_dropdown = |ui: &mut egui::Ui, id_salt: &str, value: &mut String, options: &[String]| {
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(value);
+                                    let popup_id = ui.make_persistent_id(id_salt);
+                                    // A hand-painted triangle (mirroring
+                                    // `egui::ComboBox`'s own
+                                    // `paint_default_icon`, which does the
+                                    // same thing internally) rather than a
+                                    // Unicode arrow character - this app's
+                                    // bundled Medodica font doesn't cover
+                                    // the geometric-shapes block at all, and
+                                    // egui's own fallback font's coverage of
+                                    // it turned out to be inconsistent (▼
+                                    // rendered as a missing-glyph tofu box
+                                    // despite ◀/▶ elsewhere in this same
+                                    // toolbar working fine), so a painted
+                                    // shape is the only way to guarantee
+                                    // this actually renders.
+                                    // Explicit size (matching the width the
+                                    // original `egui::ComboBox` version of
+                                    // this button used) rather than
+                                    // whatever an empty-label `ui.button`
+                                    // happens to size itself to - and the
+                                    // same 0.7/0.45 width/height ratio
+                                    // `paint_default_icon` uses, not an
+                                    // arbitrary smaller one, which is what
+                                    // made the first version of this look
+                                    // squished/undersized.
+                                    let toggle = ui.add_sized(egui::vec2(18.0 * scale, ui.spacing().interact_size.y), egui::Button::new(""));
+                                    if ui.is_rect_visible(toggle.rect) {
+                                        let tri = egui::Rect::from_center_size(
+                                            toggle.rect.center(),
+                                            egui::vec2(toggle.rect.width() * 0.7, toggle.rect.height() * 0.45),
+                                        );
+                                        ui.painter().add(egui::Shape::convex_polygon(
+                                            vec![tri.left_top(), tri.right_top(), tri.center_bottom()],
+                                            COLOR_INK,
+                                            egui::Stroke::NONE,
+                                        ));
+                                    }
+                                    if toggle.clicked() {
+                                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                                    }
+                                    egui::popup::popup_below_widget(
+                                        ui,
+                                        popup_id,
+                                        &toggle,
+                                        egui::popup::PopupCloseBehavior::CloseOnClick,
+                                        |ui| {
+                                            // The toggle button itself is
+                                            // tiny (just the arrow glyph),
+                                            // and `popup_below_widget` sizes
+                                            // the popup to match its
+                                            // triggering widget - without
+                                            // this, wrapping stays on by
+                                            // default and every option's
+                                            // text wraps almost immediately
+                                            // inside that narrow starting
+                                            // width, one or two characters
+                                            // per line (reads as "vertical"
+                                            // text). Same fix `egui::ComboBox`
+                                            // itself applies internally to
+                                            // its own popup, for the same
+                                            // reason (see `combo_box.rs`).
+                                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                            if options.is_empty() {
+                                                ui.label("No existing values yet");
+                                                return;
+                                            }
+                                            let num_columns = options.len().div_ceil(DROPDOWN_COLUMN_HEIGHT).max(1);
+                                            ui.columns(num_columns, |columns| {
+                                                for (col, chunk) in options.chunks(DROPDOWN_COLUMN_HEIGHT).enumerate() {
+                                                    for option in chunk {
+                                                        if columns[col].selectable_label(value == option, option).clicked() {
+                                                            *value = option.clone();
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        },
+                                    );
+                                });
+                            };
                             let modal = egui::Modal::new(egui::Id::new("spectral_prism_save_modal")).show(egui_ctx, |ui| {
                                 ui.set_min_width(320.0 * scale);
                                 ui.heading("Save Preset");
@@ -2015,16 +2183,31 @@ impl Plugin for PrismPlugin {
                                     ui,
                                     |ui| {
                                         ui.label("Title");
-                                        ui.text_edit_singleline(&mut state.save_title_input);
+                                        field_with_dropdown(ui, "spectral_prism_save_title_dropdown", &mut state.save_title_input, &existing_titles);
                                         ui.end_row();
                                         ui.label("Author");
-                                        ui.text_edit_singleline(&mut state.save_author_input);
+                                        field_with_dropdown(
+                                            ui,
+                                            "spectral_prism_save_author_dropdown",
+                                            &mut state.save_author_input,
+                                            &existing_authors,
+                                        );
                                         ui.end_row();
                                         ui.label("Category");
-                                        ui.text_edit_singleline(&mut state.save_category_input);
+                                        field_with_dropdown(
+                                            ui,
+                                            "spectral_prism_save_category_dropdown",
+                                            &mut state.save_category_input,
+                                            &existing_categories,
+                                        );
                                         ui.end_row();
                                         ui.label("Sub-category");
-                                        ui.text_edit_singleline(&mut state.save_subcategory_input);
+                                        field_with_dropdown(
+                                            ui,
+                                            "spectral_prism_save_subcategory_dropdown",
+                                            &mut state.save_subcategory_input,
+                                            &existing_subcategories,
+                                        );
                                         ui.end_row();
                                     },
                                 );

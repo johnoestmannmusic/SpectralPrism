@@ -119,20 +119,32 @@ impl RenderWorker {
                 // See `prism_dsp::fusion::effective_mode`'s doc comment for
                 // why this degrade happens here (not to the param itself).
                 let effective_fusion = FusionRenderParams { mode: effective_mode(request.fusion.mode, &current_source_b), ..request.fusion };
-                let rendered = render_fused_loop(
-                    &current_source,
-                    &current_source_b,
-                    sample_rate,
-                    request.freeze_point_pct,
-                    request.volume_pct,
-                    request.tune_semitones,
-                    request.formant_shift_semitones,
-                    &effective_fusion,
-                    request.stereo_width_pct,
-                    request.loop_length_seconds,
-                    root_note,
-                );
-                output.store(Arc::new(rendered));
+                // Caught rather than left to unwind: a panic in here (e.g.
+                // an empty/malformed source slipping through - see the real
+                // bug this guards against in `apply_preset`'s
+                // `unload_samples` handling) would otherwise silently kill
+                // this whole background thread, permanently freezing
+                // `output` at whatever the last successful render was with
+                // no error surfaced anywhere - worse than just skipping one
+                // bad render and staying alive for the next request.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_fused_loop(
+                        &current_source,
+                        &current_source_b,
+                        sample_rate,
+                        request.freeze_point_pct,
+                        request.volume_pct,
+                        request.tune_semitones,
+                        request.formant_shift_semitones,
+                        &effective_fusion,
+                        request.stereo_width_pct,
+                        request.loop_length_seconds,
+                        root_note,
+                    )
+                })) {
+                    Ok(rendered) => output.store(Arc::new(rendered)),
+                    Err(_) => eprintln!("SpectralPrism: render worker panicked on a request - skipping this render"),
+                }
             }
         });
 
@@ -405,5 +417,51 @@ mod tests {
         let mixed = output.load().channels[0].clone();
 
         assert_ne!(mixed, a_alone, "Mix at 100% with Sample B loaded should audibly differ from plain Sample A");
+    }
+
+    #[test]
+    fn worker_survives_a_panicking_render_and_processes_the_next_request() {
+        // Regression test for a real bug: unlike Sample B, Sample A has no
+        // empty-source guard (`render_fused_loop`/`render_frozen_loop`
+        // assume at least one channel and panic otherwise) - a caller that
+        // ever manages to store an empty Sample A (as `apply_preset`'s
+        // `unload_samples` handling once did, before being fixed to fall
+        // back to the synthetic placeholder tone instead) must not be able
+        // to permanently kill this background thread. Proves the worker
+        // stays alive and responsive to a subsequent, valid request even
+        // after a request that panics mid-render.
+        let sample_rate = 48000.0;
+        let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
+            channels: Vec::new(),
+            sample_rate,
+            root_note: DEFAULT_ROOT_NOTE,
+        })));
+
+        let source_a = make_empty_source();
+        let trigger = RenderTrigger::new();
+        let _worker = RenderWorker::spawn(trigger.clone(), source_a.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+
+        let request = RenderRequest {
+            freeze_point_pct: 50.0,
+            volume_pct: 100.0,
+            tune_semitones: 0.0,
+            formant_shift_semitones: 0.0,
+            stereo_width_pct: 30.0,
+            loop_length_seconds: DEFAULT_LOOP_SECONDS,
+            fusion: FusionRenderParams::default(),
+        };
+        trigger.request_render(request);
+        // Give the panicking request time to be picked up and fail - the
+        // worker thread must not have died as a result.
+        thread::sleep(Duration::from_millis(200));
+        assert!(output.load().channels.is_empty(), "a panicking render should not have published anything");
+
+        // A source swapped in *after* the panic, on a *new* request, should
+        // still get rendered normally - proving the worker thread is still
+        // alive and looping, not silently dead.
+        source_a.store(Arc::new(vec![vec![0.1f32; (sample_rate * 1.0) as usize]]));
+        trigger.request_render(request);
+        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker thread appears to have died after the earlier panic");
+        assert_eq!(output.load().channels.len(), 2);
     }
 }
