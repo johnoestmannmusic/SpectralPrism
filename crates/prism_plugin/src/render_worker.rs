@@ -125,6 +125,7 @@ impl RenderWorker {
                     sample_rate,
                     request.freeze_point_pct,
                     request.volume_pct,
+                    request.tune_semitones,
                     request.formant_shift_semitones,
                     &effective_fusion,
                     request.stereo_width_pct,
@@ -198,6 +199,7 @@ mod tests {
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -224,6 +226,7 @@ mod tests {
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -259,6 +262,7 @@ mod tests {
             trigger.request_render(RenderRequest {
                 freeze_point_pct,
                 volume_pct: 100.0,
+                tune_semitones: 0.0,
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 0.0,
                 loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -292,6 +296,7 @@ mod tests {
         let request = RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -340,6 +345,7 @@ mod tests {
         trigger.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -374,6 +380,7 @@ mod tests {
         trigger_a_only.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
@@ -388,6 +395,7 @@ mod tests {
         trigger_mix.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
+            tune_semitones: 0.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,

@@ -141,7 +141,7 @@ const RENDER_THROTTLE_MS: f32 = 100.0;
 /// screenshot of the actual rendered content at `DEFAULT_SCALE` rather than
 /// guessed.
 const BASE_EDITOR_WIDTH: u32 = 950;
-const BASE_EDITOR_HEIGHT: u32 = 545;
+const BASE_EDITOR_HEIGHT: u32 = 585;
 /// The editor opens at this multiple of the base size by default (matching
 /// `apply_gui_scale`'s scale factor, since the two are computed from the
 /// same base) - requested directly ("too small to read" at 1x, then a
@@ -439,6 +439,14 @@ struct PrismPluginParams {
     #[id = "sample_a_volume"]
     pub sample_a_volume: FloatParam,
 
+    /// Retunes Sample A's input in semitones (decimal for microtonal),
+    /// applied before Freezing/Fusion - lets two differently-pitched
+    /// samples be lined up to the same tone. See
+    /// `prism_dsp::resample::apply_tune`'s doc comment for the vari-speed
+    /// technique this uses.
+    #[id = "sample_a_tune"]
+    pub sample_a_tune: FloatParam,
+
     #[id = "formant_shift"]
     pub formant_shift: FloatParam,
 
@@ -459,6 +467,10 @@ struct PrismPluginParams {
     /// normalization attenuation only, never a boost.
     #[id = "sample_b_volume"]
     pub sample_b_volume: FloatParam,
+
+    /// Sample B's own Tune, mirroring `sample_a_tune`.
+    #[id = "sample_b_tune"]
+    pub sample_b_tune: FloatParam,
 
     /// Sample B's own Formant Shift, independent of Sample A's.
     #[id = "formant_shift_b"]
@@ -541,6 +553,7 @@ impl Default for PrismPlugin {
             last_requested: RenderRequest {
                 freeze_point_pct: 50.0,
                 volume_pct: 100.0,
+                tune_semitones: 0.0,
                 formant_shift_semitones: 0.0,
                 stereo_width_pct: 30.0,
                 loop_length_seconds: prism_dsp::render::DEFAULT_LOOP_SECONDS,
@@ -572,6 +585,8 @@ impl Default for PrismPluginParams {
             // ceiling is what enforces "can only reduce, never boost".
             sample_a_volume: FloatParam::new("Volume", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
+            sample_a_tune: FloatParam::new("Tune", 0.0, FloatRange::Linear { min: -24.0, max: 24.0 })
+                .with_unit(" st"),
             formant_shift: FloatParam::new(
                 "Formant Shift",
                 0.0,
@@ -585,6 +600,8 @@ impl Default for PrismPluginParams {
                 .with_unit(" %"),
             sample_b_volume: FloatParam::new("Volume", 100.0, FloatRange::Linear { min: 0.0, max: 100.0 })
                 .with_unit(" %"),
+            sample_b_tune: FloatParam::new("Tune", 0.0, FloatRange::Linear { min: -24.0, max: 24.0 })
+                .with_unit(" st"),
             formant_shift_b: FloatParam::new("Formant Shift B", 0.0, FloatRange::Linear { min: -12.0, max: 12.0 })
                 .with_unit(" st"),
             // A blend slider, not an intensity dial - 50/50 is the honest
@@ -764,6 +781,7 @@ fn current_render_request(params: &PrismPluginParams) -> RenderRequest {
     RenderRequest {
         freeze_point_pct: params.freeze_point.value(),
         volume_pct: params.sample_a_volume.value(),
+        tune_semitones: params.sample_a_tune.value(),
         formant_shift_semitones: params.formant_shift.value(),
         stereo_width_pct: params.stereo_width.value(),
         loop_length_seconds: params.loop_length_seconds.value(),
@@ -772,6 +790,7 @@ fn current_render_request(params: &PrismPluginParams) -> RenderRequest {
             freeze_point_b_pct: params.freeze_point_b.value(),
             formant_shift_b_semitones: params.formant_shift_b.value(),
             volume_b_pct: params.sample_b_volume.value(),
+            tune_b_semitones: params.sample_b_tune.value(),
             mix_amount_pct: params.fusion_mix_amount.value(),
             cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
             convolve_amount_pct: params.fusion_convolve_amount.value(),
@@ -823,11 +842,19 @@ fn load_sample_from_path(
 /// `prism_cli`'s own WAV writer isn't done here since that one deliberately
 /// stays float (a fast-iteration DSP test harness, not a distributable
 /// export), and the two have no shared dependency to justify merging over.
+/// Peak-normalizes the frozen loop before writing it out (same
+/// `peak_normalize_channels` used at sample-load time) - the loop's overall
+/// level is whatever Volume/Freeze Point/Fusion happened to produce, which
+/// is rarely anywhere near 0 dBFS, so an un-normalized export would come out
+/// quieter than it needs to for no audible benefit.
 fn write_loop_buffer_wav(path: &Path, buffer: &LoopBufferData) -> Result<(), String> {
-    let Some(left) = buffer.channels.first() else {
+    if buffer.channels.is_empty() {
         return Err("nothing has been frozen yet - load a sample first".to_string());
-    };
-    let right = buffer.channels.get(1).unwrap_or(left);
+    }
+    let mut channels = buffer.channels.clone();
+    peak_normalize_channels(&mut channels);
+    let left = &channels[0];
+    let right = channels.get(1).unwrap_or(left);
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -857,6 +884,10 @@ struct Preset {
     /// must still play at its original level, not silently attenuated.
     #[serde(default = "default_volume_pct")]
     volume_a_pct: f32,
+    /// `#[serde(default)]` (0.0, i.e. untuned) - presets saved before Tune
+    /// existed must still play at their original pitch.
+    #[serde(default)]
+    tune_a_semitones: f32,
     formant_shift_semitones: f32,
     stereo_width_pct: f32,
     /// `#[serde(default)]` with a custom default fn (not the bare
@@ -913,6 +944,9 @@ struct Preset {
     /// Mirrors `volume_a_pct` above for Sample B.
     #[serde(default = "default_volume_pct")]
     volume_b_pct: f32,
+    /// Mirrors `tune_a_semitones` for Sample B.
+    #[serde(default)]
+    tune_b_semitones: f32,
     #[serde(default)]
     formant_shift_b_semitones: f32,
     /// `#[serde(default = "default_fusion_mix_amount_pct")]`: Mix is a
@@ -937,6 +971,21 @@ struct Preset {
     /// loaded when this preset was saved.
     #[serde(default)]
     sample_path_b: Option<PathBuf>,
+    /// When true, `apply_preset` unloads Sample A and Sample B entirely
+    /// (clearing `source`/`source_b`, both `sample_path` params, and both
+    /// `loaded_filename`s) instead of its normal behavior of leaving
+    /// whatever's currently loaded untouched when `sample_path`/
+    /// `sample_path_b` are `None`. Ordinary presets never need this - a
+    /// preset without a referenced sample simply doesn't touch the current
+    /// one, which is the right default for e.g. a "just the ADSR" preset -
+    /// but a true "back to default" Init preset needs an explicit way to
+    /// say "no, really, unload everything," which plain `None` can't
+    /// express. `#[serde(default)]` (false) for presets saved before this
+    /// existed, and left `false` by `Preset::capture` (never set by the
+    /// ordinary Save flow) - only meaningful on a hand-authored preset file
+    /// like the factory `Init.spjson`.
+    #[serde(default)]
+    unload_samples: bool,
     /// Browsable/sortable metadata, entered via the Save dialog - see
     /// `PrismEditorState::show_save_dialog`. `#[serde(default)]` (empty
     /// strings) for presets saved before the Preset Browser existed; the
@@ -986,6 +1035,7 @@ impl Preset {
         Self {
             freeze_point_pct: params.freeze_point.value(),
             volume_a_pct: params.sample_a_volume.value(),
+            tune_a_semitones: params.sample_a_tune.value(),
             formant_shift_semitones: params.formant_shift.value(),
             stereo_width_pct: params.stereo_width.value(),
             loop_length_seconds: params.loop_length_seconds.value(),
@@ -1002,12 +1052,16 @@ impl Preset {
             fusion_mode: params.fusion_mode.value().preset_id().to_string(),
             freeze_point_b_pct: params.freeze_point_b.value(),
             volume_b_pct: params.sample_b_volume.value(),
+            tune_b_semitones: params.sample_b_tune.value(),
             formant_shift_b_semitones: params.formant_shift_b.value(),
             fusion_mix_amount_pct: params.fusion_mix_amount.value(),
             fusion_cross_synth_amount_pct: params.fusion_cross_synth_amount.value(),
             fusion_convolve_amount_pct: params.fusion_convolve_amount.value(),
             fusion_ring_mod_amount_pct: params.fusion_ring_mod_amount.value(),
             sample_path_b: params.sample_path_b.lock().unwrap().clone(),
+            // Never set by the ordinary Save flow - see the field's own doc
+            // comment; only a hand-authored preset file sets this.
+            unload_samples: false,
             // Not tied to any param - left blank here; the Save dialog
             // (the only place that actually writes a named library preset
             // to disk) fills these in on the `Preset` this returns before
@@ -1117,6 +1171,10 @@ fn load_preset(dir: &Path, name: &str) -> Result<Preset, String> {
     read_preset_file(&preset_file_path(dir, name))
 }
 
+fn delete_preset(dir: &Path, name: &str) -> Result<(), String> {
+    std::fs::remove_file(preset_file_path(dir, name)).map_err(|e| format!("couldn't delete preset file: {e}"))
+}
+
 /// GUI-thread-only state for the editor - not shared with the audio thread
 /// and not persisted. Which file is loaded lives on the plugin itself
 /// (`PrismPlugin::loaded_filename`) instead, so it survives the editor
@@ -1152,6 +1210,35 @@ struct PrismEditorState {
     /// info panel at the bottom of the modal. Distinct from actually
     /// loading it, which only happens when "Load" is clicked.
     preset_browser_selected: Option<String>,
+    /// Set to the on-disk name of a preset the user just clicked "Delete"
+    /// on, so the browser can ask "are you sure?" before actually removing
+    /// the file - cleared on confirm, cancel, or closing the browser.
+    preset_browser_delete_confirm: Option<String>,
+    /// Whether the "Export Preset..." strip-sample-paths prompt is
+    /// currently open - opened by clicking "Export Preset...", closed by
+    /// its own Export/Cancel buttons or backdrop click/Escape.
+    show_export_preset_dialog: bool,
+    /// Checkbox state in that prompt: whether to reduce
+    /// `sample_path`/`sample_path_b` in the exported file down to just the
+    /// filename (for sharing a preset publicly, where the recipient's
+    /// absolute sample paths won't exist) - the filename itself is kept
+    /// (not blanked entirely) so the info panel/relocate dialog can still
+    /// show/suggest it; `apply_preset`'s existing missing-sample relocate
+    /// flow already handles a path that doesn't resolve gracefully on
+    /// re-import, prompting to locate the file rather than failing.
+    export_strip_sample_paths: bool,
+    /// Title/Author/Category/Sub-category/date-last-updated of whichever
+    /// preset is currently active in memory - kept in sync everywhere
+    /// `params.selected_preset` itself is (load/import/save), since
+    /// `Preset::capture` deliberately leaves these blank (only the Save
+    /// dialog fills them in directly, on the `Preset` it's about to write).
+    /// "Export Preset..." needs this metadata to carry it into the
+    /// exported file instead of exporting it blank.
+    current_preset_title: String,
+    current_preset_author: String,
+    current_preset_category: String,
+    current_preset_sub_category: String,
+    current_preset_date_last_updated: String,
 }
 
 /// One preset's worth of metadata for the Preset Browser's tree/search/info
@@ -1596,6 +1683,20 @@ impl Plugin for PrismPlugin {
                     }
                 };
 
+                // Shared by `apply_preset` for both Sample A and Sample B
+                // when `preset.unload_samples` is set (see that field's doc
+                // comment) - clears the source audio, the persisted sample
+                // path, and the displayed filename, then re-renders so the
+                // (now silent) state actually takes effect immediately.
+                let unload_sample = |source: &Arc<ArcSwap<Vec<Vec<f32>>>>,
+                                      sample_path_slot: &Mutex<Option<PathBuf>>,
+                                      loaded_filename: &Arc<ArcSwapOption<String>>| {
+                    source.store(Arc::new(Vec::new()));
+                    *sample_path_slot.lock().unwrap() = None;
+                    loaded_filename.store(None);
+                    trigger.request_render(current_render_request(&params));
+                };
+
                 // Shared by `apply_preset` for both Sample A and Sample B:
                 // loads `path_opt` if it's `Some`, and if that fails,
                 // prompts the user to locate the moved/missing file - see
@@ -1653,6 +1754,7 @@ impl Plugin for PrismPlugin {
                     };
                     set(&params.freeze_point, preset.freeze_point_pct);
                     set(&params.sample_a_volume, preset.volume_a_pct);
+                    set(&params.sample_a_tune, preset.tune_a_semitones);
                     set(&params.formant_shift, preset.formant_shift_semitones);
                     set(&params.stereo_width, preset.stereo_width_pct);
                     set(&params.loop_length_seconds, preset.loop_length_seconds);
@@ -1666,6 +1768,7 @@ impl Plugin for PrismPlugin {
                     set(&params.pan_width_pct, preset.pan_width_pct);
                     set(&params.freeze_point_b, preset.freeze_point_b_pct);
                     set(&params.sample_b_volume, preset.volume_b_pct);
+                    set(&params.sample_b_tune, preset.tune_b_semitones);
                     set(&params.formant_shift_b, preset.formant_shift_b_semitones);
                     set(&params.fusion_mix_amount, preset.fusion_mix_amount_pct);
                     set(&params.fusion_cross_synth_amount, preset.fusion_cross_synth_amount_pct);
@@ -1674,6 +1777,13 @@ impl Plugin for PrismPlugin {
                     setter.begin_set_parameter(&params.fusion_mode);
                     setter.set_parameter(&params.fusion_mode, FusionMode::from_preset_id(&preset.fusion_mode));
                     setter.end_set_parameter(&params.fusion_mode);
+
+                    if preset.unload_samples {
+                        unload_sample(&source, &params.sample_path, &loaded_filename);
+                        unload_sample(&source_b, &params.sample_path_b, &loaded_filename_b);
+                        state.error = None;
+                        return (None, None);
+                    }
 
                     // Sample A's own relocate error takes priority over
                     // Sample B's (or its absence) if both need attention -
@@ -1774,6 +1884,11 @@ impl Plugin for PrismPlugin {
                                     // Save immediately overwrites it instead
                                     // of requiring the name to be retyped.
                                     state.preset_name_input = name.clone();
+                                    state.current_preset_title = preset.title.clone();
+                                    state.current_preset_author = preset.author.clone();
+                                    state.current_preset_category = preset.category.clone();
+                                    state.current_preset_sub_category = preset.sub_category.clone();
+                                    state.current_preset_date_last_updated = preset.date_last_updated.clone();
                                 }
                                 Err(e) => state.error = Some(e),
                             }
@@ -1875,22 +1990,19 @@ impl Plugin for PrismPlugin {
                                                 state.preset_name_input = stem.clone();
                                             }
                                             *params.selected_preset.lock().unwrap() = stem;
+                                            state.current_preset_title = preset.title.clone();
+                                            state.current_preset_author = preset.author.clone();
+                                            state.current_preset_category = preset.category.clone();
+                                            state.current_preset_sub_category = preset.sub_category.clone();
+                                            state.current_preset_date_last_updated = preset.date_last_updated.clone();
                                         }
                                         Err(e) => state.error = Some(e),
                                     }
                                 }
                             }
                             if ui.button("Export Preset...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("SpectralPrism Preset", &[PRESET_FILE_EXTENSION])
-                                    .set_file_name(&format!("preset.{PRESET_FILE_EXTENSION}"))
-                                    .save_file()
-                                {
-                                    match write_preset_file(&path, &Preset::capture(&params)) {
-                                        Ok(()) => state.error = None,
-                                        Err(e) => state.error = Some(e),
-                                    }
-                                }
+                                state.export_strip_sample_paths = false;
+                                state.show_export_preset_dialog = true;
                             }
                         });
 
@@ -1932,6 +2044,11 @@ impl Plugin for PrismPlugin {
                                                     Ok(()) => {
                                                         *params.selected_preset.lock().unwrap() = Some(title.clone());
                                                         state.preset_name_input = title;
+                                                        state.current_preset_title = preset.title.clone();
+                                                        state.current_preset_author = preset.author.clone();
+                                                        state.current_preset_category = preset.category.clone();
+                                                        state.current_preset_sub_category = preset.sub_category.clone();
+                                                        state.current_preset_date_last_updated = preset.date_last_updated.clone();
                                                         state.error = None;
                                                         state.show_save_dialog = false;
                                                     }
@@ -1948,6 +2065,71 @@ impl Plugin for PrismPlugin {
                             });
                             if modal.should_close() {
                                 state.show_save_dialog = false;
+                            }
+                        }
+
+                        if state.show_export_preset_dialog {
+                            let modal = egui::Modal::new(egui::Id::new("spectral_prism_export_preset_modal")).show(egui_ctx, |ui| {
+                                ui.set_min_width(340.0 * scale);
+                                ui.heading("Export Preset");
+                                ui.add_space(4.0);
+                                ui.checkbox(&mut state.export_strip_sample_paths, "Strip sample file path(s)");
+                                ui.add_space(4.0);
+                                ui.colored_label(
+                                    COLOR_DIM,
+                                    "For sharing this preset publicly, since your absolute sample path(s) won't exist on \
+                                     another machine (the sample's filename is kept either way). Leave unchecked to keep \
+                                     the full path for your own use. Either way, re-importing a preset whose sample \
+                                     can't be found will prompt to locate it.",
+                                );
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Export...").clicked() {
+                                        state.show_export_preset_dialog = false;
+                                        let default_name = if state.preset_name_input.trim().is_empty() {
+                                            "preset".to_string()
+                                        } else {
+                                            state.preset_name_input.trim().to_string()
+                                        };
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("SpectralPrism Preset", &[PRESET_FILE_EXTENSION])
+                                            .set_file_name(&format!("{default_name}.{PRESET_FILE_EXTENSION}"))
+                                            .save_file()
+                                        {
+                                            let mut preset = Preset::capture(&params);
+                                            // `Preset::capture` deliberately
+                                            // leaves these blank (only the
+                                            // Save dialog fills them in
+                                            // directly) - carry forward
+                                            // whichever preset is currently
+                                            // active in memory instead of
+                                            // exporting empty metadata.
+                                            preset.title = state.current_preset_title.clone();
+                                            preset.author = state.current_preset_author.clone();
+                                            preset.category = state.current_preset_category.clone();
+                                            preset.sub_category = state.current_preset_sub_category.clone();
+                                            preset.date_last_updated = state.current_preset_date_last_updated.clone();
+                                            if state.export_strip_sample_paths {
+                                                // Keeps just the filename (not blanked entirely) so the
+                                                // recipient - and this preset's own info panel/relocate
+                                                // dialog - still knows what to look for.
+                                                preset.sample_path = preset.sample_path.as_ref().and_then(|p| p.file_name()).map(PathBuf::from);
+                                                preset.sample_path_b =
+                                                    preset.sample_path_b.as_ref().and_then(|p| p.file_name()).map(PathBuf::from);
+                                            }
+                                            match write_preset_file(&path, &preset) {
+                                                Ok(()) => state.error = None,
+                                                Err(e) => state.error = Some(e),
+                                            }
+                                        }
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        state.show_export_preset_dialog = false;
+                                    }
+                                });
+                            });
+                            if modal.should_close() {
+                                state.show_export_preset_dialog = false;
                             }
                         }
 
@@ -1982,13 +2164,14 @@ impl Plugin for PrismPlugin {
                                         ui.colored_label(COLOR_DIM, "No presets found.");
                                     }
                                     for (category, sub_categories) in &by_category {
-                                        egui::CollapsingHeader::new(category).default_open(true).show(ui, |ui| {
+                                        egui::CollapsingHeader::new(category).default_open(false).show(ui, |ui| {
                                             for (sub_category, entries) in sub_categories {
-                                                egui::CollapsingHeader::new(sub_category).default_open(true).show(ui, |ui| {
+                                                egui::CollapsingHeader::new(sub_category).default_open(false).show(ui, |ui| {
                                                     for entry in entries {
                                                         let is_selected = state.preset_browser_selected.as_deref() == Some(entry.name.as_str());
                                                         if ui.selectable_label(is_selected, &entry.title).clicked() {
                                                             state.preset_browser_selected = Some(entry.name.clone());
+                                                            state.preset_browser_delete_confirm = None;
                                                         }
                                                     }
                                                 });
@@ -2002,6 +2185,18 @@ impl Plugin for PrismPlugin {
                                     .preset_browser_selected
                                     .as_deref()
                                     .and_then(|name| presets_dir.as_deref().and_then(|dir| load_preset(dir, name).ok()));
+                                // Always exactly 3 rows, whether or not
+                                // anything is selected ("-" placeholders
+                                // otherwise), so the modal's overall height -
+                                // and the position of the Load/Delete/Close
+                                // row below - never jumps around as
+                                // different presets (with different amounts
+                                // of metadata) are highlighted. Each row uses
+                                // a truncating label so an unusually long
+                                // value can't wrap and grow the row either.
+                                let row = |ui: &mut egui::Ui, text: String| {
+                                    ui.add(egui::Label::new(egui::RichText::new(text).color(COLOR_DIM)).truncate());
+                                };
                                 match &selected_entry {
                                     Some(preset) => {
                                         let sample_a_name = preset
@@ -2021,20 +2216,27 @@ impl Plugin for PrismPlugin {
                                         let author = if preset.author.is_empty() { "-" } else { &preset.author };
                                         let build = if preset.build_number.is_empty() { "unknown" } else { &preset.build_number };
                                         let updated = if preset.date_last_updated.is_empty() { "unknown" } else { &preset.date_last_updated };
-                                        ui.colored_label(COLOR_DIM, format!("Title: {title}    Author: {author}"));
-                                        ui.colored_label(
-                                            COLOR_DIM,
-                                            format!("Category: {} / {}", display_category(&preset.category), display_category(&preset.sub_category)),
+                                        row(
+                                            ui,
+                                            format!(
+                                                "Title: {title}    Author: {author}    Category: {} / {}",
+                                                display_category(&preset.category),
+                                                display_category(&preset.sub_category)
+                                            ),
                                         );
-                                        ui.colored_label(COLOR_DIM, format!("Sample A: {sample_a_name}    Sample B: {sample_b_name}"));
-                                        ui.colored_label(
-                                            COLOR_DIM,
-                                            format!("Algorithm: {}", FusionMode::variants()[algorithm.to_index()]),
+                                        row(
+                                            ui,
+                                            format!(
+                                                "Sample A: {sample_a_name}    Sample B: {sample_b_name}    Algorithm: {}",
+                                                FusionMode::variants()[algorithm.to_index()]
+                                            ),
                                         );
-                                        ui.colored_label(COLOR_DIM, format!("Build: {build}    Last updated: {updated}"));
+                                        row(ui, format!("Build: {build}    Last updated: {updated}"));
                                     }
                                     None => {
-                                        ui.colored_label(COLOR_DIM, "Select a preset above to see its details.");
+                                        row(ui, "Title: -    Author: -    Category: -".to_string());
+                                        row(ui, "Sample A: -    Sample B: -    Algorithm: -".to_string());
+                                        row(ui, "Build: -    Last updated: -".to_string());
                                     }
                                 }
 
@@ -2048,13 +2250,41 @@ impl Plugin for PrismPlugin {
                                             }
                                         }
                                         state.show_preset_browser = false;
+                                        state.preset_browser_delete_confirm = None;
                                     }
+
+                                    let pending_delete = state.preset_browser_delete_confirm.clone().filter(|pending| {
+                                        state.preset_browser_selected.as_deref() == Some(pending.as_str())
+                                    });
+                                    if let Some(name) = pending_delete {
+                                        ui.colored_label(COLOR_ERROR, "Delete this preset?");
+                                        if ui.button("Confirm Delete").clicked() {
+                                            if let Some(dir) = &presets_dir {
+                                                match delete_preset(dir, &name) {
+                                                    Ok(()) => {
+                                                        state.preset_browser_entries = load_preset_browser_entries(dir);
+                                                        state.preset_browser_selected = None;
+                                                    }
+                                                    Err(e) => state.error = Some(e),
+                                                }
+                                            }
+                                            state.preset_browser_delete_confirm = None;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            state.preset_browser_delete_confirm = None;
+                                        }
+                                    } else if ui.add_enabled(can_load, egui::Button::new("Delete")).clicked() {
+                                        state.preset_browser_delete_confirm = state.preset_browser_selected.clone();
+                                    }
+
                                     if ui.button("Close").clicked() {
                                         state.show_preset_browser = false;
+                                        state.preset_browser_delete_confirm = None;
                                     }
                                 });
                             });
                             if modal.should_close() {
+                                state.preset_browser_delete_confirm = None;
                                 state.show_preset_browser = false;
                             }
                         }
@@ -2082,6 +2312,7 @@ impl Plugin for PrismPlugin {
                             let current_fusion = params.fusion_mode.value();
                             egui::Grid::new("spectral_prism_sample_a_grid").num_columns(2).spacing([8.0 * scale, 6.0 * scale]).show(left, |ui| {
                                 param_row(ui, "Freeze Point", &params.freeze_point, setter);
+                                param_row(ui, "Tune", &params.sample_a_tune, setter);
                                 param_row(ui, "Formant Shift", &params.formant_shift, setter);
 
                                 ui.label("Spectral Fusion");
@@ -2135,6 +2366,7 @@ impl Plugin for PrismPlugin {
                                         ui,
                                         |ui| {
                                             param_row(ui, "Freeze Point", &params.freeze_point_b, setter);
+                                            param_row(ui, "Tune", &params.sample_b_tune, setter);
                                             param_row(ui, "Formant Shift", &params.formant_shift_b, setter);
                                             match current_fusion {
                                                 FusionMode::Mix => param_row(ui, "Mix Blend (A \u{2194} B)", &params.fusion_mix_amount, setter),
@@ -2233,10 +2465,13 @@ impl Plugin for PrismPlugin {
                                 open_sample_dialog_b(state);
                             }
                             if ui.button("Export WAV Sample...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("WAV", &["wav"])
-                                    .set_file_name("SpectralPrism-export.wav")
-                                    .save_file()
+                                let default_name = if state.preset_name_input.trim().is_empty() {
+                                    "SpectralPrism-export".to_string()
+                                } else {
+                                    state.preset_name_input.trim().to_string()
+                                };
+                                if let Some(path) =
+                                    rfd::FileDialog::new().add_filter("WAV", &["wav"]).set_file_name(&format!("{default_name}.wav")).save_file()
                                 {
                                     match write_loop_buffer_wav(&path, &loop_buffer.load()) {
                                         Ok(()) => state.error = None,
@@ -2330,6 +2565,7 @@ impl Plugin for PrismPlugin {
             sample_rate,
             request.freeze_point_pct,
             request.volume_pct,
+            request.tune_semitones,
             request.formant_shift_semitones,
             &effective_fusion,
             request.stereo_width_pct,
@@ -2520,6 +2756,7 @@ mod preset_tests {
         Preset {
             freeze_point_pct: 42.0,
             volume_a_pct: 85.0,
+            tune_a_semitones: 2.0,
             formant_shift_semitones: -3.5,
             stereo_width_pct: 60.0,
             loop_length_seconds: 2.5,
@@ -2536,12 +2773,14 @@ mod preset_tests {
             fusion_mode: "cross-synth".to_string(),
             freeze_point_b_pct: 65.0,
             volume_b_pct: 90.0,
+            tune_b_semitones: -1.5,
             formant_shift_b_semitones: 1.5,
             fusion_mix_amount_pct: 30.0,
             fusion_cross_synth_amount_pct: 80.0,
             fusion_convolve_amount_pct: 90.0,
             fusion_ring_mod_amount_pct: 70.0,
             sample_path_b: Some(PathBuf::from("/some/sample-b.wav")),
+            unload_samples: false,
             title: "My Test Preset".to_string(),
             author: "Test Author".to_string(),
             category: "Pads".to_string(),
@@ -2558,6 +2797,7 @@ mod preset_tests {
 
         assert_eq!(restored.freeze_point_pct, original.freeze_point_pct);
         assert_eq!(restored.volume_a_pct, original.volume_a_pct);
+        assert_eq!(restored.tune_a_semitones, original.tune_a_semitones);
         assert_eq!(restored.formant_shift_semitones, original.formant_shift_semitones);
         assert_eq!(restored.stereo_width_pct, original.stereo_width_pct);
         assert_eq!(restored.loop_length_seconds, original.loop_length_seconds);
@@ -2574,12 +2814,14 @@ mod preset_tests {
         assert_eq!(restored.fusion_mode, original.fusion_mode);
         assert_eq!(restored.freeze_point_b_pct, original.freeze_point_b_pct);
         assert_eq!(restored.volume_b_pct, original.volume_b_pct);
+        assert_eq!(restored.tune_b_semitones, original.tune_b_semitones);
         assert_eq!(restored.formant_shift_b_semitones, original.formant_shift_b_semitones);
         assert_eq!(restored.fusion_mix_amount_pct, original.fusion_mix_amount_pct);
         assert_eq!(restored.fusion_cross_synth_amount_pct, original.fusion_cross_synth_amount_pct);
         assert_eq!(restored.fusion_convolve_amount_pct, original.fusion_convolve_amount_pct);
         assert_eq!(restored.fusion_ring_mod_amount_pct, original.fusion_ring_mod_amount_pct);
         assert_eq!(restored.sample_path_b, original.sample_path_b);
+        assert_eq!(restored.unload_samples, original.unload_samples);
         assert_eq!(restored.title, original.title);
         assert_eq!(restored.author, original.author);
         assert_eq!(restored.category, original.category);
@@ -2607,16 +2849,19 @@ mod preset_tests {
         }"#;
         let restored: Preset = serde_json::from_str(old_json).expect("old-format preset should still deserialize");
         assert_eq!(restored.volume_a_pct, 100.0);
+        assert_eq!(restored.tune_a_semitones, 0.0);
         assert_eq!(restored.fusion_mode, "");
         assert_eq!(FusionMode::from_preset_id(&restored.fusion_mode), FusionMode::Off);
         assert_eq!(restored.freeze_point_b_pct, 50.0);
         assert_eq!(restored.volume_b_pct, 100.0);
+        assert_eq!(restored.tune_b_semitones, 0.0);
         assert_eq!(restored.formant_shift_b_semitones, 0.0);
         assert_eq!(restored.fusion_mix_amount_pct, 50.0);
         assert_eq!(restored.fusion_cross_synth_amount_pct, 100.0);
         assert_eq!(restored.fusion_convolve_amount_pct, 100.0);
         assert_eq!(restored.fusion_ring_mod_amount_pct, 100.0);
         assert_eq!(restored.sample_path_b, None);
+        assert!(!restored.unload_samples);
         assert_eq!(restored.title, "");
         assert_eq!(restored.author, "");
         assert_eq!(restored.category, "");
@@ -2664,6 +2909,19 @@ mod preset_tests {
 
         assert_eq!(restored.freeze_point_pct, original.freeze_point_pct);
         assert_eq!(restored.sample_path, None);
+    }
+
+    #[test]
+    fn delete_preset_removes_it_from_disk() {
+        let dir = temp_dir("delete_preset");
+        let original = sample_preset(None);
+        save_preset(&dir, "My Test Preset", &original).expect("save should succeed");
+        assert!(list_presets(&dir).contains(&"My Test Preset".to_string()));
+
+        delete_preset(&dir, "My Test Preset").expect("delete should succeed");
+
+        assert!(!list_presets(&dir).contains(&"My Test Preset".to_string()));
+        assert!(load_preset(&dir, "My Test Preset").is_err());
     }
 
     #[test]
@@ -2728,9 +2986,26 @@ mod preset_tests {
         let samples: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).collect();
         // Interleaved L/R - spot-check the first frame rather than every
         // sample, converting back from i16 to approximately the original
-        // f32 range to allow for quantization rounding.
-        assert!((samples[0] as f32 / i16::MAX as f32 - 0.5).abs() < 1e-3);
-        assert!((samples[1] as f32 / i16::MAX as f32 - -0.25).abs() < 1e-3);
+        // f32 range to allow for quantization rounding. The export is
+        // peak-normalized, so the 0.5/-0.25 source (peak 0.5) comes out
+        // scaled 2x to 1.0/-0.5.
+        assert!((samples[0] as f32 / i16::MAX as f32 - 1.0).abs() < 1e-3);
+        assert!((samples[1] as f32 / i16::MAX as f32 - -0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn write_loop_buffer_wav_peak_normalizes_a_quiet_buffer() {
+        let dir = temp_dir("wav_export_normalize");
+        let path = dir.join("export.wav");
+        let buffer = LoopBufferData { channels: vec![vec![0.1f32; 100], vec![-0.05f32; 100]], sample_rate: 48000.0, root_note: DEFAULT_ROOT_NOTE };
+
+        write_loop_buffer_wav(&path, &buffer).expect("export should succeed");
+
+        let mut reader = hound::WavReader::open(&path).expect("exported file should be a valid WAV");
+        let samples: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).collect();
+        // Peak was 0.1, so the export should be scaled 10x to hit unity.
+        assert!((samples[0] as f32 / i16::MAX as f32 - 1.0).abs() < 1e-3);
+        assert!((samples[1] as f32 / i16::MAX as f32 - -0.5).abs() < 1e-3);
     }
 
     #[test]
