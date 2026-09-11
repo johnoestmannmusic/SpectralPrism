@@ -1,6 +1,7 @@
 # SpectralPrism
 
-<img width="1920" height="1080" alt="SpectralPrism-Snapshot" src="https://github.com/user-attachments/assets/2e363f58-13e9-41f2-9308-291b1df1d783" />
+<img width="1778" height="1094" alt="image" src="https://github.com/user-attachments/assets/aac628a5-045b-4f66-9d94-3a714c7d473f" />
+
 
 A phase-vocoder "freeze" instrument: load a sample, freeze a spectral
 snapshot of it into a sustained, evolving pad/drone, and play it back
@@ -9,29 +10,14 @@ standalone application.
 
 Built in Rust on top of [nih-plug](https://github.com/robbert-vdh/nih-plug).
 
-## Features
+## Key Features
 
 - **Freeze Point** - where in the source sample the spectral snapshot is taken.
-- **Volume** - per-sample level trim, applied on top of automatic peak-normalization at load time.
-- **Tune** - retunes the source sample in semitones (decimal values for microtonal
-  tuning) before it's frozen, for lining up the pitch of two different samples.
 - **Formant Shift** - reshapes the frozen spectrum's envelope independently of pitch.
-- **Stereo Width** - blends in the source's natural per-channel difference, plus a
-  deterministic phase decorrelation so even a mono source can be spread into stereo.
-- **Loop Length** - how long the frozen loop buffer is (0.5-8s), trading off
-  texture/movement against memory and export file size. The loop is phase-locked
-  and reconstructed with circular overlap-add, so it repeats with no audible seam
-  at any length.
 - **Spectral Fusion** - load a second sample ("Sample B", with its own Freeze
   Point/Volume/Tune/Formant Shift) and combine it with Sample A's frozen spectrum
   via seven algorithms - Mix, Cross-Synth, Convolve, Ring Modulate, Spectral Max,
   Spectral Min, or Cycle - or leave it Off for plain single-sample Freeze.
-- **Full polyphony** (up to 16 voices) with per-voice **ADSR envelope**, velocity
-  sensitivity, pitch bend, and a per-voice pan randomizer.
-- **Preset Browser** - a searchable Category/Sub-category tree of on-disk presets
-  (`.spjson`) with an info panel and delete, plus JSON import/export via file
-  dialog (with optional sample-path stripping for public sharing) and sample-path
-  recovery if a shared preset's sample can't be found on the machine it's loaded on.
 - **Export WAV** - export the current frozen loop as a peak-normalized WAV file,
   e.g. for use in a tracker or sampler.
 
