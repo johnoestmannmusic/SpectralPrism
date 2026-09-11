@@ -287,9 +287,6 @@ enum FusionMode {
     #[id = "off"]
     #[name = "Off"]
     Off,
-    #[id = "audition"]
-    #[name = "Audition"]
-    Audition,
     #[id = "mix"]
     #[name = "Mix"]
     Mix,
@@ -323,7 +320,6 @@ impl FusionMode {
     fn to_dsp(self) -> DspFusionMode {
         match self {
             FusionMode::Off => DspFusionMode::Off,
-            FusionMode::Audition => DspFusionMode::Audition,
             FusionMode::Mix => DspFusionMode::Mix,
             FusionMode::CrossSynth => DspFusionMode::CrossSynth,
             FusionMode::Convolve => DspFusionMode::Convolve,
@@ -351,7 +347,6 @@ impl FusionMode {
     fn preset_id(self) -> &'static str {
         match self {
             FusionMode::Off => "off",
-            FusionMode::Audition => "audition",
             FusionMode::Mix => "mix",
             FusionMode::CrossSynth => "cross-synth",
             FusionMode::Convolve => "convolve",
@@ -364,7 +359,6 @@ impl FusionMode {
 
     fn from_preset_id(id: &str) -> Self {
         match id {
-            "audition" => FusionMode::Audition,
             "mix" => FusionMode::Mix,
             "cross-synth" => FusionMode::CrossSynth,
             "convolve" => FusionMode::Convolve,
@@ -378,14 +372,15 @@ impl FusionMode {
 
     /// Two teaching-oriented sentences describing the currently selected
     /// algorithm, shown in the editor's info box underneath Sample B -
-    /// prefixed with "Single | <Name>: " for the two modes that only ever
-    /// play one sample unmodified (Off, Audition), or "Fusion | <Name>: "
-    /// for every mode that actually combines A and B, so the box always
-    /// names what's currently selected before explaining it.
+    /// prefixed with "Single | <Name>: " for the one mode that only ever
+    /// plays one sample unmodified (Off - Audition was removed as
+    /// redundant with Mix at 100%, which does the same thing), or
+    /// "Fusion | <Name>: " for every mode that actually combines A and B,
+    /// so the box always names what's currently selected before explaining
+    /// it.
     fn info_text(self) -> &'static str {
         match self {
             FusionMode::Off => "Single | Freeze: Only Sample A's frozen snapshot plays. A Freeze Point captures a single spectral instant of a sample and loops it forever, which is the whole idea behind SpectralPrism.",
-            FusionMode::Audition => "Single | Audition: Only Sample B's frozen snapshot plays, and Sample A is ignored entirely. Useful for previewing what Sample B sounds like frozen on its own before blending it in.",
             FusionMode::Mix => "Fusion | Mix: A's and B's independently frozen loops are crossfaded together using the Mix Blend slider. At 0% you hear pure A, at 100% pure B, and in between a simple volume blend of both.",
             FusionMode::CrossSynth => "Fusion | Cross-Synth: B's overall spectral shape (formants) is imposed onto A's fine detail and phase, so A keeps its texture but takes on B's tonal color. The Amount slider fades this reshaping in from A's own shape (0%) to B's shape (100%).",
             FusionMode::Convolve => "Fusion | Convolve: A's and B's frozen spectra are multiplied together bin by bin, which is how audio convolution works in the frequency domain. This tends to produce dense, resonant, often unpredictable new timbres, dialed in with the Amount slider.",

@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 pub struct RenderRequest {
     pub freeze_point_pct: f32,
     pub volume_pct: f32,
+    pub tune_semitones: f32,
     pub formant_shift_semitones: f32,
     pub stereo_width_pct: f32,
     pub loop_length_seconds: f32,
@@ -333,7 +334,7 @@ mod tests {
         let source_a = make_source(sample_rate, 1.0);
         let trigger = RenderTrigger::new();
         let _worker = RenderWorker::spawn(trigger.clone(), source_a, make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
-        // Audition needs Sample B, but none was ever loaded (make_empty_source) -
+        // Mix needs Sample B, but none was ever loaded (make_empty_source) -
         // this must degrade to Off (plain Sample A) rather than panic on an
         // empty source.
         trigger.request_render(RenderRequest {
@@ -342,7 +343,7 @@ mod tests {
             formant_shift_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
-            fusion: FusionRenderParams { mode: FusionMode::Audition, ..FusionRenderParams::default() },
+            fusion: FusionRenderParams { mode: FusionMode::Mix, ..FusionRenderParams::default() },
         });
 
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish a render in time");
@@ -350,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_uses_source_b_when_present_for_audition_mode() {
+    fn worker_uses_source_b_when_present_for_mix_mode() {
         let sample_rate = 48000.0;
         let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
             channels: Vec::new(),
@@ -358,7 +359,7 @@ mod tests {
             root_note: DEFAULT_ROOT_NOTE,
         })));
 
-        // Sample A and Sample B are different frequencies - Audition mode
+        // Sample A and Sample B are different frequencies - Mix at 100%
         // must audibly use B, not silently fall back to A.
         let source_a = make_source(sample_rate, 1.0);
         let source_b = {
@@ -382,20 +383,19 @@ mod tests {
         let a_alone = output.load().channels[0].clone();
 
         output.store(Arc::new(LoopBufferData { channels: Vec::new(), sample_rate, root_note: DEFAULT_ROOT_NOTE }));
-        let trigger_audition = RenderTrigger::new();
-        let _worker_audition =
-            RenderWorker::spawn(trigger_audition.clone(), source_a, source_b, sample_rate, DEFAULT_ROOT_NOTE, output.clone());
-        trigger_audition.request_render(RenderRequest {
+        let trigger_mix = RenderTrigger::new();
+        let _worker_mix = RenderWorker::spawn(trigger_mix.clone(), source_a, source_b, sample_rate, DEFAULT_ROOT_NOTE, output.clone());
+        trigger_mix.request_render(RenderRequest {
             freeze_point_pct: 50.0,
             volume_pct: 100.0,
             formant_shift_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
-            fusion: FusionRenderParams { mode: FusionMode::Audition, ..FusionRenderParams::default() },
+            fusion: FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 100.0, ..FusionRenderParams::default() },
         });
-        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the Audition render in time");
-        let audition = output.load().channels[0].clone();
+        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the Mix render in time");
+        let mixed = output.load().channels[0].clone();
 
-        assert_ne!(audition, a_alone, "Audition mode with Sample B loaded should audibly differ from plain Sample A");
+        assert_ne!(mixed, a_alone, "Mix at 100% with Sample B loaded should audibly differ from plain Sample A");
     }
 }

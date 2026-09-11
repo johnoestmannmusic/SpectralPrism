@@ -1,7 +1,31 @@
+use crate::formant::semitones_to_ratio;
+
 /// Classic-sampler playback rate for `note` relative to `root_note`, in
 /// equal temperament: rate = 2^((note - root_note) / 12).
 pub fn playback_rate(note: u8, root_note: u8) -> f64 {
     2f64.powf((note as f64 - root_note as f64) / 12.0)
+}
+
+/// Pitch-shifts `signal` by `tune_semitones` (positive = higher; fractional
+/// values give microtonal tuning) via "vari-speed" resampling - the same
+/// technique a classic sampler's playback rate uses, but applied here to
+/// the static time-domain source *before* freezing (not at playback), so
+/// two differently-pitched samples can be tuned to match each other before
+/// their spectra are captured/combined. Reuses `resample_linear` by lying
+/// about the signal's own sample rate: treating it as `sample_rate * ratio`
+/// and resampling down to `sample_rate` shortens the buffer for a ratio
+/// greater than 1 (raising pitch when the shorter buffer is later analyzed/
+/// played at the same nominal rate) and lengthens it for a ratio less than
+/// 1 (lowering pitch) - exactly `prepare_source_for_plugin_rate`'s own
+/// resampling, just with the "the file's actual rate differs from the
+/// plugin's" framing replaced by "we want this rate to sound different".
+/// A no-op (returns an owned copy) at 0 semitones.
+pub fn apply_tune(signal: &[f32], tune_semitones: f32, sample_rate: f32) -> Vec<f32> {
+    if tune_semitones == 0.0 {
+        return signal.to_vec();
+    }
+    let ratio = semitones_to_ratio(tune_semitones);
+    resample_linear(signal, sample_rate * ratio, sample_rate)
 }
 
 /// Naive linear-interpolation whole-buffer resample from `from_rate` to
@@ -130,6 +154,61 @@ mod tests {
         };
         let ratio = count_crossings(&resampled) as f32 / count_crossings(&source) as f32;
         assert!((ratio - 1.0).abs() < 0.02, "expected ~the same number of cycles after resampling, got ratio {}", ratio);
+    }
+
+    #[test]
+    fn apply_tune_at_zero_semitones_is_identity() {
+        let sample_rate = 48000.0;
+        let source: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.1).sin()).collect();
+        let tuned = apply_tune(&source, 0.0, sample_rate);
+        assert_eq!(tuned, source);
+    }
+
+    #[test]
+    fn apply_tune_shifts_length_by_the_semitone_ratio() {
+        // Vari-speed: raising pitch by an octave (ratio 2.0) compresses the
+        // buffer to half its length (same content, played twice as fast
+        // when read back at the same nominal rate); lowering by an octave
+        // doubles it.
+        let sample_rate = 48000.0;
+        let source = vec![0.0f32; 48000];
+
+        let up_an_octave = apply_tune(&source, 12.0, sample_rate);
+        let ratio_up = source.len() as f32 / up_an_octave.len() as f32;
+        assert!((ratio_up - 2.0).abs() < 0.01, "expected the buffer to halve for +12 semitones, got ratio {}", ratio_up);
+
+        let down_an_octave = apply_tune(&source, -12.0, sample_rate);
+        let ratio_down = down_an_octave.len() as f32 / source.len() as f32;
+        assert!((ratio_down - 2.0).abs() < 0.01, "expected the buffer to double for -12 semitones, got ratio {}", ratio_down);
+    }
+
+    #[test]
+    fn apply_tune_preserves_total_cycle_count_while_compressing_the_buffer() {
+        // Tuning doesn't remove or add cycles - it just fits the same
+        // number of them into a shorter (or longer) buffer, which is what
+        // actually raises (or lowers) the perceived pitch when that buffer
+        // is later analyzed/played at the plugin's unchanged sample rate.
+        let sample_rate = 48000.0;
+        let cycles = 100.0f32;
+        let len = sample_rate as usize;
+        let source: Vec<f32> = (0..len).map(|i| (2.0 * std::f32::consts::PI * cycles * i as f32 / sample_rate).sin()).collect();
+        let tuned = apply_tune(&source, 12.0, sample_rate);
+
+        let count_crossings = |sig: &[f32]| -> usize { sig.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() };
+        let ratio = count_crossings(&tuned) as f32 / count_crossings(&source) as f32;
+        assert!((ratio - 1.0).abs() < 0.02, "expected ~the same total number of cycles, just compressed, got ratio {}", ratio);
+        assert!((tuned.len() as f32 - source.len() as f32 / 2.0).abs() < 10.0, "expected the buffer to be ~halved for +12 semitones");
+    }
+
+    #[test]
+    fn apply_tune_supports_fractional_microtonal_values() {
+        let sample_rate = 48000.0;
+        let source = vec![0.0f32; 48000];
+        let tuned = apply_tune(&source, 0.5, sample_rate);
+        // A tiny shift should only barely change the buffer length, not
+        // panic or produce something wildly different in size.
+        let ratio = source.len() as f32 / tuned.len() as f32;
+        assert!((ratio - 2f32.powf(0.5 / 12.0)).abs() < 0.001, "expected a ~2^(0.5/12) length ratio for a 0.5-semitone tune, got {}", ratio);
     }
 
     #[test]

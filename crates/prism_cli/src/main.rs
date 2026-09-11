@@ -28,6 +28,11 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     formant_shift: f32,
 
+    /// Retune the input sample in semitones (decimal for microtonal),
+    /// applied before freezing.
+    #[arg(long, default_value_t = 0.0)]
+    tune: f32,
+
     /// MIDI note to play (60 = middle C = root note, no pitch shift).
     #[arg(long, default_value_t = DEFAULT_ROOT_NOTE)]
     note: u8,
@@ -106,6 +111,7 @@ fn main() {
         sample_rate,
         args.freeze_point,
         100.0,
+        args.tune,
         args.formant_shift,
         args.stereo_width,
         args.loop_length,
