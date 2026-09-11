@@ -12,6 +12,9 @@ Built in Rust on top of [nih-plug](https://github.com/robbert-vdh/nih-plug).
 ## Features
 
 - **Freeze Point** - where in the source sample the spectral snapshot is taken.
+- **Volume** - per-sample level trim, applied on top of automatic peak-normalization at load time.
+- **Tune** - retunes the source sample in semitones (decimal values for microtonal
+  tuning) before it's frozen, for lining up the pitch of two different samples.
 - **Formant Shift** - reshapes the frozen spectrum's envelope independently of pitch.
 - **Stereo Width** - blends in the source's natural per-channel difference, plus a
   deterministic phase decorrelation so even a mono source can be spread into stereo.
@@ -19,11 +22,18 @@ Built in Rust on top of [nih-plug](https://github.com/robbert-vdh/nih-plug).
   texture/movement against memory and export file size. The loop is phase-locked
   and reconstructed with circular overlap-add, so it repeats with no audible seam
   at any length.
+- **Spectral Fusion** - load a second sample ("Sample B", with its own Freeze
+  Point/Volume/Tune/Formant Shift) and combine it with Sample A's frozen spectrum
+  via seven algorithms - Mix, Cross-Synth, Convolve, Ring Modulate, Spectral Max,
+  Spectral Min, or Cycle - or leave it Off for plain single-sample Freeze.
 - **Full polyphony** (up to 16 voices) with per-voice **ADSR envelope**, velocity
   sensitivity, pitch bend, and a per-voice pan randomizer.
-- **JSON Preset files** (import/export via file dialog, plus a simple named on-disk
-  library), with sample-path recovery if a shared preset's sample can't be found on the machine it's loaded on.
-- **Export WAV** - export the current frozen loop as a WAV file, e.g. for use in a tracker or sampler.
+- **Preset Browser** - a searchable Category/Sub-category tree of on-disk presets
+  (`.spjson`) with an info panel and delete, plus JSON import/export via file
+  dialog (with optional sample-path stripping for public sharing) and sample-path
+  recovery if a shared preset's sample can't be found on the machine it's loaded on.
+- **Export WAV** - export the current frozen loop as a peak-normalized WAV file,
+  e.g. for use in a tracker or sampler.
 
 ## Building from source
 
