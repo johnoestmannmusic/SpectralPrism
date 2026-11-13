@@ -1,5 +1,5 @@
 use crate::analysis::analyze_frame;
-use crate::fft::{FreezeFft, HOP_SIZE};
+use crate::fft::FreezeFft;
 use crate::phase_advance::compute_advance;
 use crate::window::sine_window;
 
@@ -37,12 +37,13 @@ pub fn analyze_freeze_point(signal: &[f32], freeze_point_pct: f32, gain_pct: f32
     let max_pos = len.saturating_sub(n);
     let pct = freeze_point_pct.clamp(0.0, 100.0) / 100.0;
     let pos0 = ((pct * max_pos as f32).round() as usize).min(max_pos);
-    let pos1 = (pos0 + HOP_SIZE).min(max_pos);
+    let hop = fft.hop();
+    let pos1 = (pos0 + hop).min(max_pos);
 
     let f0 = analyze_frame(signal, pos0, fft, &window);
     let f1 = analyze_frame(signal, pos1, fft, &window);
 
-    let advance = compute_advance(&f0.phase, &f1.phase, HOP_SIZE, n);
+    let advance = compute_advance(&f0.phase, &f1.phase, hop, n);
 
     // Clamped to [0, 1] (never a boost) - the Volume control's own
     // `FloatParam` range already enforces 0-100%, this is just defense in

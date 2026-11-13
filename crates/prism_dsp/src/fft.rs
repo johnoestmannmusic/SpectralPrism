@@ -6,6 +6,39 @@ pub const FFT_SIZE: usize = 2048;
 pub const HOP_SIZE: usize = 1024;
 pub const NUM_BINS: usize = FFT_SIZE / 2 + 1;
 
+/// Selectable freeze FFT sizes ("smear"). Larger windows capture a longer
+/// slice of the source and resolve it more finely, for the smoother,
+/// Paulstretch-like stretched sound; 2048 is the original engine size.
+pub const FFT_SIZES: [usize; 3] = [2048, 8192, 32768];
+
+/// Maps a requested FFT size onto a supported one. Anything unsupported
+/// (including 0, what an older caller that omits the argument sends through
+/// wasm-bindgen) falls back to the original `FFT_SIZE`.
+pub fn sanitize_fft_size(requested: u32) -> usize {
+    let requested = requested as usize;
+    if FFT_SIZES.contains(&requested) {
+        requested
+    } else {
+        FFT_SIZE
+    }
+}
+
+/// The largest supported size no bigger than `requested` that still fits the
+/// material: the source must hold at least two analysis frames one hop apart
+/// (`size + size / 2` samples) and the loop at least four hops, otherwise a
+/// big window degenerates into a buzzing single frame. Deterministic in its
+/// inputs, so playback and export always agree. Never goes below `FFT_SIZE`.
+pub fn effective_fft_size(requested: usize, signal_len: usize, loop_samples: f32) -> usize {
+    FFT_SIZES
+        .iter()
+        .rev()
+        .copied()
+        .find(|&size| {
+            size <= requested && (size == FFT_SIZE || (signal_len >= size + size / 2 && loop_samples >= (2 * size) as f32))
+        })
+        .unwrap_or(FFT_SIZE)
+}
+
 /// Wraps a pair of realfft R2C/C2R plans for a fixed FFT size, built once and
 /// reused across every analysis/synthesis call. realfft handles real-signal
 /// packing internally, exposing only the N/2+1 unique bins - which matches
@@ -34,6 +67,12 @@ impl FreezeFft {
 
     pub fn num_bins(&self) -> usize {
         self.size() / 2 + 1
+    }
+
+    /// Analysis/synthesis hop: half the window, which the sine-window
+    /// overlap-add needs to sum to exactly one.
+    pub fn hop(&self) -> usize {
+        self.size() / 2
     }
 
     /// Forward real -> complex transform. `time_domain` may be used as
@@ -99,6 +138,44 @@ mod tests {
 
         for (a, b) in original.iter().zip(roundtripped.iter()) {
             assert!((a - b).abs() < 1e-4, "roundtrip mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn sanitizes_requested_sizes() {
+        assert_eq!(sanitize_fft_size(0), FFT_SIZE);
+        assert_eq!(sanitize_fft_size(4096), FFT_SIZE);
+        assert_eq!(sanitize_fft_size(8192), 8192);
+        assert_eq!(sanitize_fft_size(32768), 32768);
+    }
+
+    #[test]
+    fn effective_size_falls_back_for_short_material() {
+        let long = 10 * 44_100;
+        assert_eq!(effective_fft_size(32768, long, 10.0 * 44_100.0), 32768);
+        // Source too short for two 32k frames: 8k still fits.
+        assert_eq!(effective_fft_size(32768, 20_000, 10.0 * 44_100.0), 8192);
+        // Loop too short for four 32k hops.
+        assert_eq!(effective_fft_size(32768, long, 0.5 * 44_100.0), 8192);
+        // Tiny source: never below the original size.
+        assert_eq!(effective_fft_size(32768, 100, 100.0), FFT_SIZE);
+        assert_eq!(effective_fft_size(FFT_SIZE, long, 1e9), FFT_SIZE);
+    }
+
+    #[test]
+    fn realfft_roundtrip_every_size() {
+        for &size in FFT_SIZES.iter() {
+            let fft = FreezeFft::with_size(size);
+            assert_eq!(fft.hop(), size / 2);
+            let original: Vec<f32> = (0..size).map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0).collect();
+            let mut time_domain = original.clone();
+            let mut spectrum = fft.make_spectrum_buffer();
+            fft.forward(&mut time_domain, &mut spectrum);
+            let mut back = fft.make_time_buffer();
+            fft.inverse(&mut spectrum, &mut back);
+            for (a, b) in original.iter().zip(back.iter()) {
+                assert!((a - b).abs() < 1e-3, "size {} roundtrip mismatch: {} vs {}", size, a, b);
+            }
         }
     }
 

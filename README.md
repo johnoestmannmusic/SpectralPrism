@@ -21,6 +21,41 @@ Built in Rust on top of [nih-plug](https://github.com/robbert-vdh/nih-plug).
 - **Export WAV** - export the current frozen loop as a peak-normalized WAV file,
   e.g. for use in a tracker or sampler.
 
+### Instrument stages (from SpectralPrism Tracker)
+
+The instrument is a signal chain, shown in the editor as a strip of stage
+cards - click a card to edit it, click its LED to switch it on or off:
+
+```
+SOURCE ─▶ FM ─▶ SPECTRAL ─▶ PERCUSSION ─▶ TEXTURE ║ VOICE ─▶ CHORD ─▶ CHORUS
+└──── rendered into the loop (a moment to update) ┘ └─ per note (instant) ─┘
+```
+
+- **Source** - Sample A/B, plus trim and playback mode (Auto / Loop /
+  Ping-pong / One-shot). With every render stage off the plugin is a plain
+  sampler.
+- **FM** - the sample phase-modulates a sine carrier (Direct / Stack / Pair
+  algorithms, op2 feedback, index sway, stereo detune, sample-hold and
+  quantise lo-fi).
+- **Spectral** - the freeze and Spectral Fusion above, plus FFT "smear" size,
+  a **Shimmer** freeze style, and four **modulation routes** (LFO / ramp /
+  random) that sweep any spectral parameter - including Loop Length - over
+  the loop.
+- **Percussion** - re-synthesises the result as a drum hit (modal body,
+  noise, transient, pitch sweep, drive, compression), with Kick / Snare /
+  Metal / Hat starting points.
+- **Texture (MicroTextures)** - granular post-processing: grain scatter,
+  density modulation, chaos, retrigger stutter, formant filter bank, bit-crush.
+- **Voice** - amp envelope, transpose / fine tune, vibrato, mono/poly with
+  voice cap and choke, pan spread, and a resonant **filter** (LP/HP/BP) with
+  its own envelope and key follow.
+- **Chord** - each note plays a chord (11 shapes or custom intervals) with
+  inversions, octaves, detune, strum and pan spread.
+- **Chorus** - stereo ensemble chorus on the whole instrument.
+
+Every control explains itself in the info line when hovered. For layered
+sounds, run several instances of the plugin.
+
 ## Building from source
 
 Requires a recent stable Rust toolchain ([rustup.rs](https://rustup.rs)).
@@ -42,11 +77,17 @@ cargo run --release --bin prism_plugin_standalone
 
 ## Project structure
 
-- `crates/prism_dsp` - the DSP core (spectral freeze, formant shift, stereo
-  width, envelopes, voice management, resampling). Pure Rust, no dependency on
-  nih-plug or any plugin format - unit-tested independently of the plugin wrapper.
-- `crates/prism_plugin` - the nih-plug/egui wrapper: parameters, GUI, presets,
-  MIDI/voice handling, VST3/CLAP export.
+- `crates/prism_dsp` - the DSP core (spectral freeze, fusion, shimmer,
+  modulation, FM transform, percussion, microtextures, the full render
+  `chain`, plus the real-time voice engine: playback modes, chord, filter,
+  chorus). Pure Rust, no dependency on nih-plug or any plugin format -
+  unit-tested independently of the plugin wrapper. SpectralPrism Tracker
+  vendors this crate (`scripts/vendor-prism-dsp.mjs`); this repo is its
+  source of truth.
+- `crates/prism_plugin` - the nih-plug/egui wrapper: parameters
+  (`params.rs`, `stage_params.rs`), presets (`preset.rs`), the signal-chain
+  editor (`editor.rs`, `stages.rs`, `widgets.rs`), the background render
+  worker, MIDI/voice handling, VST3/CLAP export.
 - `crates/prism_cli` - a WAV-in/WAV-out command-line harness for fast by-ear DSP
   iteration without needing a plugin host.
 - `xtask` - the bundling tool (`cargo xtask bundle ...`), provided by nih-plug.

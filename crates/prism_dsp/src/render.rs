@@ -1,8 +1,9 @@
-use crate::fft::{FreezeFft, FFT_SIZE, HOP_SIZE};
+use crate::fft::{effective_fft_size, FreezeFft, FFT_SIZE};
 use crate::formant::{compute_spectral_envelope, reimpose_envelope, semitones_to_ratio, shift_envelope};
 use crate::freeze::analyze_freeze_point;
 use crate::resample::apply_tune;
 use crate::resynth::{ola_accumulate_circular, FreezeResynth};
+use crate::shimmer::{apply_low_cut, averaged_magnitude, render_static_shimmer, ShimmerParams};
 use crate::stereo::{decorrelation_spread, width_multiplier};
 use crate::window::sine_window;
 use std::f32::consts::TAU;
@@ -16,7 +17,9 @@ pub const DEFAULT_ROOT_NOTE: u8 = 60;
 /// comment on phase-locking + circular OLA), not by picking a "safe"
 /// length or blending the seam after the fact.
 pub const MIN_LOOP_SECONDS: f32 = 0.5;
-pub const MAX_LOOP_SECONDS: f32 = 8.0;
+/// Raised from the plugin's 8 s for the tracker, where a slow freeze-point
+/// scan across a long loop is the Paulstretch-style drone.
+pub const MAX_LOOP_SECONDS: f32 = 60.0;
 /// Preserves the old (pre-`FREEZE-PLAN-024`) auto-computed minimum as the
 /// new param's default, so a freshly-created instance (or a preset saved
 /// before this param existed) starts at a length already known to sound
@@ -95,19 +98,110 @@ pub fn render_frozen_loop(
     loop_length_seconds: f32,
     root_note: u8,
 ) -> LoopBufferData {
-    let fft = FreezeFft::new();
-    let window = sine_window(FFT_SIZE);
+    render_frozen_loop_sized(
+        channels,
+        sample_rate,
+        freeze_point_pct,
+        volume_pct,
+        tune_semitones,
+        formant_shift_semitones,
+        stereo_width_pct,
+        loop_length_seconds,
+        root_note,
+        FFT_SIZE,
+    )
+}
+
+/// Clamped loop length -> whole number of `hop`-sized steps.
+pub(crate) fn loop_hops(loop_length_seconds: f32, sample_rate: f32, hop: usize) -> usize {
+    let loop_seconds = loop_length_seconds.clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
+    ((loop_seconds * sample_rate) / hop as f32).round().max(1.0) as usize
+}
+
+/// The FFT size a render will really use for `requested` (see
+/// `fft::effective_fft_size`), given the shortest source it analyses.
+pub(crate) fn render_fft_size(requested: usize, signal_len: usize, loop_length_seconds: f32, sample_rate: f32) -> usize {
+    let loop_seconds = loop_length_seconds.clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
+    effective_fft_size(requested, signal_len, loop_seconds * sample_rate)
+}
+
+/// `render_frozen_loop` with a selectable freeze FFT size (`fft::FFT_SIZES`;
+/// falls back to a smaller size when the material is too short for it).
+#[allow(clippy::too_many_arguments)]
+pub fn render_frozen_loop_sized(
+    channels: &[Vec<f32>],
+    sample_rate: f32,
+    freeze_point_pct: f32,
+    volume_pct: f32,
+    tune_semitones: f32,
+    formant_shift_semitones: f32,
+    stereo_width_pct: f32,
+    loop_length_seconds: f32,
+    root_note: u8,
+    fft_size: usize,
+) -> LoopBufferData {
+    render_frozen_loop_styled(
+        channels,
+        sample_rate,
+        freeze_point_pct,
+        volume_pct,
+        tune_semitones,
+        formant_shift_semitones,
+        stereo_width_pct,
+        loop_length_seconds,
+        root_note,
+        fft_size,
+        &ShimmerParams::default(),
+    )
+}
+
+/// `render_frozen_loop_sized` with a freeze style: when `shimmer.enabled`
+/// the averaged-magnitude, random-phase Shimmer freeze (`shimmer.rs`) is
+/// rendered instead of the phase-locked one; otherwise this is exactly the
+/// classic freeze.
+#[allow(clippy::too_many_arguments)]
+pub fn render_frozen_loop_styled(
+    channels: &[Vec<f32>],
+    sample_rate: f32,
+    freeze_point_pct: f32,
+    volume_pct: f32,
+    tune_semitones: f32,
+    formant_shift_semitones: f32,
+    stereo_width_pct: f32,
+    loop_length_seconds: f32,
+    root_note: u8,
+    fft_size: usize,
+    shimmer: &ShimmerParams,
+) -> LoopBufferData {
+    let source_len = channels.iter().map(Vec::len).min().unwrap_or(0);
+    let fft = FreezeFft::with_size(render_fft_size(fft_size, source_len, loop_length_seconds, sample_rate));
+    let window = sine_window(fft.size());
 
     let source_left = channels.first().expect("render_frozen_loop requires at least one channel");
     let source_right = channels.get(1).unwrap_or(source_left);
     let tuned_left = apply_tune(source_left, tune_semitones, sample_rate);
     let tuned_right = apply_tune(source_right, tune_semitones, sample_rate);
 
-    let loop_seconds = loop_length_seconds.clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
-    let num_hops = ((loop_seconds * sample_rate) / HOP_SIZE as f32).round().max(1.0) as usize;
-    let out_len = num_hops * HOP_SIZE;
+    let num_hops = loop_hops(loop_length_seconds, sample_rate, fft.hop());
+    let out_len = num_hops * fft.hop();
 
     let width = width_multiplier(stereo_width_pct);
+
+    if shimmer.enabled {
+        let (mag_l, mag_r) = shimmer_magnitudes(
+            &tuned_left,
+            &tuned_right,
+            freeze_point_pct,
+            volume_pct,
+            formant_shift_semitones,
+            width,
+            shimmer,
+            &fft,
+            sample_rate,
+        );
+        let (left_out, right_out) = render_static_shimmer(&fft, out_len, shimmer.seed, &mag_l, &mag_r, width);
+        return LoopBufferData { channels: vec![left_out, right_out], sample_rate, root_note };
+    }
 
     let frozen_left = analyze_freeze_point(&tuned_left, freeze_point_pct, volume_pct, &fft);
     let frozen_right_natural = analyze_freeze_point(&tuned_right, freeze_point_pct, volume_pct, &fft);
@@ -147,6 +241,32 @@ pub fn render_frozen_loop(
     }
 }
 
+/// Shimmer analysis for one (already tuned) source: span-averaged
+/// magnitudes for L and the natural R, R blended toward its own content by
+/// `width` (exactly like the classic freeze), each formant-shifted, then
+/// low-cut.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shimmer_magnitudes(
+    left: &[f32],
+    right: &[f32],
+    freeze_point_pct: f32,
+    volume_pct: f32,
+    formant_shift_semitones: f32,
+    width: f32,
+    shimmer: &ShimmerParams,
+    fft: &FreezeFft,
+    sample_rate: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mag_l = averaged_magnitude(left, freeze_point_pct, shimmer.span_pct, volume_pct, fft);
+    let mag_r_natural = averaged_magnitude(right, freeze_point_pct, shimmer.span_pct, volume_pct, fft);
+    let mag_r: Vec<f32> = mag_l.iter().zip(mag_r_natural.iter()).map(|(&l, &r)| l + (r - l) * width).collect();
+    let mut mag_l = apply_formant_shift(mag_l, formant_shift_semitones, fft);
+    let mut mag_r = apply_formant_shift(mag_r, formant_shift_semitones, fft);
+    apply_low_cut(&mut mag_l, shimmer.low_cut_hz, sample_rate, fft.size());
+    apply_low_cut(&mut mag_r, shimmer.low_cut_hz, sample_rate, fft.size());
+    (mag_l, mag_r)
+}
+
 /// Reshapes `mag`'s spectral envelope (formants) by `formant_shift_semitones`
 /// while preserving its fine harmonic structure - a no-op when the shift is
 /// zero. Split out of `render_frozen_loop` so the Spectral Fusion combine
@@ -180,7 +300,7 @@ pub(crate) fn render_channel(mag: Vec<f32>, phase0: Vec<f32>, advance: Vec<f32>,
     while pos < out_len {
         resynth.next_frame(fft, &mut spectrum_scratch, &mut time_scratch);
         ola_accumulate_circular(&mut accum, pos, &time_scratch);
-        pos += HOP_SIZE;
+        pos += fft.hop();
     }
 
     accum
@@ -214,6 +334,7 @@ pub(crate) fn quantize_advance_for_loop(advance: &[f32], num_hops: usize) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fft::{FFT_SIZES, HOP_SIZE};
 
     fn make_test_signal(len: usize) -> Vec<f32> {
         (0..len)
@@ -323,9 +444,61 @@ mod tests {
         let short_seconds = short_result.channels[0].len() as f32 / sample_rate;
         assert!(short_seconds >= MIN_LOOP_SECONDS - 0.1, "requesting 0s should clamp up to MIN_LOOP_SECONDS, got {}", short_seconds);
 
-        let long_result = render_frozen_loop(&[signal], sample_rate, 30.0, 100.0, 0.0, 0.0, 0.0, 30.0, DEFAULT_ROOT_NOTE);
+        let long_result = render_frozen_loop(&[signal], sample_rate, 30.0, 100.0, 0.0, 0.0, 0.0, 90.0, DEFAULT_ROOT_NOTE);
         let long_seconds = long_result.channels[0].len() as f32 / sample_rate;
-        assert!(long_seconds <= MAX_LOOP_SECONDS + 0.1, "requesting 30s should clamp down to MAX_LOOP_SECONDS, got {}", long_seconds);
+        assert!(long_seconds <= MAX_LOOP_SECONDS + 0.1, "requesting 90s should clamp down to MAX_LOOP_SECONDS, got {}", long_seconds);
+        assert!(long_seconds >= MAX_LOOP_SECONDS - 0.1, "requesting 90s should render the full MAX_LOOP_SECONDS, got {}", long_seconds);
+    }
+
+    #[test]
+    fn sized_render_at_default_size_is_bit_identical() {
+        let sample_rate = 44100.0;
+        let signal = make_test_signal((sample_rate * 3.0) as usize);
+        let a = render_frozen_loop(&[signal.clone()], sample_rate, 42.0, 100.0, 0.0, 2.0, 30.0, 1.5, DEFAULT_ROOT_NOTE);
+        let b = render_frozen_loop_sized(&[signal], sample_rate, 42.0, 100.0, 0.0, 2.0, 30.0, 1.5, DEFAULT_ROOT_NOTE, FFT_SIZE);
+        assert_eq!(a.channels, b.channels);
+    }
+
+    #[test]
+    fn every_fft_size_renders_a_seamless_hop_aligned_loop() {
+        let sample_rate = 44100.0;
+        let signal = make_test_signal((sample_rate * 4.0) as usize);
+        for &size in FFT_SIZES.iter() {
+            let hop = size / 2;
+            let result = render_frozen_loop_sized(&[signal.clone()], sample_rate, 40.0, 100.0, 0.0, 0.0, 30.0, 3.0, DEFAULT_ROOT_NOTE, size);
+            assert_eq!(result.channels.len(), 2);
+            let left = &result.channels[0];
+            assert_eq!(left.len() % hop, 0, "size {}: {} samples is not a whole number of hops", size, left.len());
+            assert!((left.len() as f32 / sample_rate - 3.0).abs() < hop as f32 / sample_rate, "size {}: wrong loop length", size);
+            assert!(left.iter().all(|s| s.is_finite()), "size {}: non-finite output", size);
+            let peak = left.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            assert!(peak > 1e-3, "size {}: silent output", size);
+            // Seamless wrap: the jump across the loop seam is no bigger than
+            // the largest sample-to-sample step inside the loop.
+            let max_step = left.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+            let seam = (left[0] - left[left.len() - 1]).abs();
+            assert!(seam <= max_step * 1.01 + 1e-6, "size {}: seam jump {} vs max step {}", size, seam, max_step);
+        }
+    }
+
+    #[test]
+    fn larger_windows_render_differently() {
+        let sample_rate = 44100.0;
+        let signal = make_test_signal((sample_rate * 4.0) as usize);
+        let small = render_frozen_loop_sized(&[signal.clone()], sample_rate, 40.0, 100.0, 0.0, 0.0, 0.0, 3.0, DEFAULT_ROOT_NOTE, 2048);
+        let large = render_frozen_loop_sized(&[signal], sample_rate, 40.0, 100.0, 0.0, 0.0, 0.0, 3.0, DEFAULT_ROOT_NOTE, 32768);
+        assert_ne!(small.channels[0], large.channels[0]);
+    }
+
+    #[test]
+    fn short_material_falls_back_to_a_fitting_size() {
+        let sample_rate = 44100.0;
+        // 0.3 s source: too short for a 32k window, so it must not buzz on a
+        // single zero-padded frame - it drops to a size that fits.
+        let signal = make_test_signal((sample_rate * 0.3) as usize);
+        let fallback = render_frozen_loop_sized(&[signal.clone()], sample_rate, 40.0, 100.0, 0.0, 0.0, 0.0, 2.0, DEFAULT_ROOT_NOTE, 32768);
+        let eight_k = render_frozen_loop_sized(&[signal], sample_rate, 40.0, 100.0, 0.0, 0.0, 0.0, 2.0, DEFAULT_ROOT_NOTE, 8192);
+        assert_eq!(fallback.channels, eight_k.channels);
     }
 
     #[test]

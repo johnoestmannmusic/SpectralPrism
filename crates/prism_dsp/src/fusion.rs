@@ -21,10 +21,11 @@
 //! `resynth::FreezeResynth` itself) than the one-shot combines below - see
 //! `manage/KANBAN.md` for the tracked idea.
 
-use crate::fft::{FreezeFft, FFT_SIZE, HOP_SIZE};
+use crate::fft::{FreezeFft, FFT_SIZE};
 use crate::formant::compute_spectral_envelope;
 use crate::freeze::{analyze_freeze_point, FrozenSpectrum};
-use crate::render::{apply_formant_shift, quantize_advance_for_loop, render_channel, render_frozen_loop, LoopBufferData, MAX_LOOP_SECONDS, MIN_LOOP_SECONDS};
+use crate::render::{apply_formant_shift, loop_hops, quantize_advance_for_loop, render_channel, render_fft_size, render_frozen_loop_styled, LoopBufferData};
+use crate::shimmer::{apply_low_cut, averaged_magnitude, render_static_shimmer, ShimmerParams};
 use crate::resample::apply_tune;
 use crate::stereo::{decorrelation_spread, width_multiplier};
 use crate::window::sine_window;
@@ -78,7 +79,7 @@ impl FusionMode {
 /// `formant_shift_a_semitones` as a top-level `render_fused_loop` argument
 /// instead of in here, mirroring how those two are already split from the
 /// Sample-B-specific fields below.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FusionRenderParams {
     pub mode: FusionMode,
     pub freeze_point_b_pct: f32,
@@ -89,6 +90,12 @@ pub struct FusionRenderParams {
     pub cross_synth_amount_pct: f32,
     pub convolve_amount_pct: f32,
     pub ring_mod_amount_pct: f32,
+    /// Freeze FFT size (`fft::FFT_SIZES`); larger = smoother "smear".
+    /// `render_fused_loop` resolves it against the material once, so both
+    /// sources of a fusion always share one size (and one hop grid).
+    pub fft_size: usize,
+    /// Shimmer freeze style (`shimmer.rs`); disabled = classic freeze.
+    pub shimmer: ShimmerParams,
 }
 
 /// Degrades `mode` to `Off` if it needs Sample B (`FusionMode::needs_sample_b`)
@@ -120,6 +127,8 @@ impl Default for FusionRenderParams {
             cross_synth_amount_pct: 100.0,
             convolve_amount_pct: 100.0,
             ring_mod_amount_pct: 100.0,
+            fft_size: FFT_SIZE,
+            shimmer: ShimmerParams::default(),
         }
     }
 }
@@ -141,6 +150,17 @@ pub fn render_fused_loop(
     loop_length_seconds: f32,
     root_note: u8,
 ) -> LoopBufferData {
+    let mut shortest = source_a.iter().map(Vec::len).min().unwrap_or(0);
+    if fusion.mode.needs_sample_b() {
+        if let Some(b_len) = source_b.iter().map(Vec::len).min() {
+            shortest = shortest.min(b_len);
+        }
+    }
+    let resolved = FusionRenderParams {
+        fft_size: render_fft_size(fusion.fft_size, shortest, loop_length_seconds, sample_rate),
+        ..*fusion
+    };
+    let fusion = &resolved;
     if fusion.mode.is_pre_resynth() {
         render_pre_resynth_fusion(
             source_a,
@@ -191,8 +211,8 @@ fn render_pre_resynth_fusion(
     loop_length_seconds: f32,
     root_note: u8,
 ) -> LoopBufferData {
-    let fft = FreezeFft::new();
-    let window = sine_window(FFT_SIZE);
+    let fft = FreezeFft::with_size(fusion.fft_size);
+    let window = sine_window(fft.size());
 
     let a_left = source_a.first().expect("render_fused_loop requires at least one channel in Sample A");
     let a_right = source_a.get(1).unwrap_or(a_left);
@@ -203,10 +223,56 @@ fn render_pre_resynth_fusion(
     let b_left = apply_tune(b_left, fusion.tune_b_semitones, sample_rate);
     let b_right = apply_tune(b_right, fusion.tune_b_semitones, sample_rate);
 
-    let loop_seconds = loop_length_seconds.clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
-    let num_hops = ((loop_seconds * sample_rate) / HOP_SIZE as f32).round().max(1.0) as usize;
-    let out_len = num_hops * HOP_SIZE;
+    let num_hops = loop_hops(loop_length_seconds, sample_rate, fft.hop());
+    let out_len = num_hops * fft.hop();
     let width = width_multiplier(stereo_width_pct);
+
+    let amount = match fusion.mode {
+        FusionMode::CrossSynth => fusion.cross_synth_amount_pct,
+        FusionMode::Convolve => fusion.convolve_amount_pct,
+        _ => 0.0,
+    };
+
+    if fusion.shimmer.enabled {
+        // Shimmer: combine the span-averaged magnitudes (phase is random at
+        // resynthesis, so only magnitude matters to the combine), then
+        // width-blend, low-cut and render with random phases.
+        let sh = &fusion.shimmer;
+        let averaged = |signal: &[f32], fp: f32, vol: f32, formant: f32| -> FrozenSpectrum {
+            let mag = apply_formant_shift(averaged_magnitude(signal, fp, sh.span_pct, vol, &fft), formant, &fft);
+            let bins = mag.len();
+            FrozenSpectrum { mag, phase0: vec![0.0; bins], advance: vec![0.0; bins] }
+        };
+        let a_l = averaged(&a_left, freeze_point_a_pct, volume_a_pct, formant_shift_a_semitones);
+        let a_r = averaged(&a_right, freeze_point_a_pct, volume_a_pct, formant_shift_a_semitones);
+        let b_l = averaged(&b_left, fusion.freeze_point_b_pct, fusion.volume_b_pct, fusion.formant_shift_b_semitones);
+        let b_r = averaged(&b_right, fusion.freeze_point_b_pct, fusion.volume_b_pct, fusion.formant_shift_b_semitones);
+        let mut mag_l = combine_spectra(&a_l, &b_l, fusion.mode, amount, &fft).mag;
+        let combined_r = combine_spectra(&a_r, &b_r, fusion.mode, amount, &fft).mag;
+        let mut mag_r: Vec<f32> = mag_l.iter().zip(combined_r.iter()).map(|(&l, &r)| l + (r - l) * width).collect();
+        apply_low_cut(&mut mag_l, sh.low_cut_hz, sample_rate, fft.size());
+        apply_low_cut(&mut mag_r, sh.low_cut_hz, sample_rate, fft.size());
+        let (l, r) = render_static_shimmer(&fft, out_len, sh.seed, &mag_l, &mag_r, width);
+        let mut channels = vec![l, r];
+        if fusion.mode == FusionMode::Convolve {
+            let a_reference = render_frozen_loop_styled(
+                source_a,
+                sample_rate,
+                freeze_point_a_pct,
+                volume_a_pct,
+                tune_a_semitones,
+                formant_shift_a_semitones,
+                stereo_width_pct,
+                loop_length_seconds,
+                root_note,
+                fusion.fft_size,
+                sh,
+            );
+            let target_peak = a_reference.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs())).max(1e-6);
+            peak_normalize(&mut channels, target_peak);
+        }
+        return LoopBufferData { channels, sample_rate, root_note };
+    }
 
     let mut a_l = analyze_freeze_point(&a_left, freeze_point_a_pct, volume_a_pct, &fft);
     let mut a_r = analyze_freeze_point(&a_right, freeze_point_a_pct, volume_a_pct, &fft);
@@ -217,11 +283,6 @@ fn render_pre_resynth_fusion(
     b_l.mag = apply_formant_shift(b_l.mag, fusion.formant_shift_b_semitones, &fft);
     b_r.mag = apply_formant_shift(b_r.mag, fusion.formant_shift_b_semitones, &fft);
 
-    let amount = match fusion.mode {
-        FusionMode::CrossSynth => fusion.cross_synth_amount_pct,
-        FusionMode::Convolve => fusion.convolve_amount_pct,
-        _ => 0.0,
-    };
     let combined_left = combine_spectra(&a_l, &b_l, fusion.mode, amount, &fft);
     let combined_right_natural = combine_spectra(&a_r, &b_r, fusion.mode, amount, &fft);
 
@@ -249,7 +310,7 @@ fn render_pre_resynth_fusion(
         // peak amplitude exactly, so normalizing against the raw source
         // would apply a small, spurious scale even at 0% Amount (where the
         // combined spectrum is otherwise bit-identical to plain A).
-        let a_reference = render_frozen_loop(
+        let a_reference = render_frozen_loop_styled(
             source_a,
             sample_rate,
             freeze_point_a_pct,
@@ -258,7 +319,8 @@ fn render_pre_resynth_fusion(
             formant_shift_a_semitones,
             stereo_width_pct,
             loop_length_seconds,
-            root_note,
+            root_note,            fusion.fft_size,
+            &fusion.shimmer,
         );
         let target_peak = a_reference.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs())).max(1e-6);
         peak_normalize(&mut channels, target_peak);
@@ -362,7 +424,7 @@ fn render_post_resynth_fusion(
     root_note: u8,
 ) -> LoopBufferData {
     match fusion.mode {
-        FusionMode::Off => render_frozen_loop(
+        FusionMode::Off => render_frozen_loop_styled(
             source_a,
             sample_rate,
             freeze_point_a_pct,
@@ -371,10 +433,11 @@ fn render_post_resynth_fusion(
             formant_shift_a_semitones,
             stereo_width_pct,
             loop_length_seconds,
-            root_note,
+            root_note,            fusion.fft_size,
+            &fusion.shimmer,
         ),
         FusionMode::Mix | FusionMode::RingModulate | FusionMode::Cycle => {
-            let a = render_frozen_loop(
+            let a = render_frozen_loop_styled(
                 source_a,
                 sample_rate,
                 freeze_point_a_pct,
@@ -383,9 +446,10 @@ fn render_post_resynth_fusion(
                 formant_shift_a_semitones,
                 stereo_width_pct,
                 loop_length_seconds,
-                root_note,
+                root_note,                fusion.fft_size,
+            &fusion.shimmer,
             );
-            let b = render_frozen_loop(
+            let b = render_frozen_loop_styled(
                 source_b,
                 sample_rate,
                 fusion.freeze_point_b_pct,
@@ -394,7 +458,8 @@ fn render_post_resynth_fusion(
                 fusion.formant_shift_b_semitones,
                 stereo_width_pct,
                 loop_length_seconds,
-                root_note,
+                root_note,                fusion.fft_size,
+            &fusion.shimmer,
             );
             match fusion.mode {
                 FusionMode::Mix => mix_buffers(&a, &b, fusion.mix_amount_pct),
@@ -475,6 +540,7 @@ fn peak_normalize(channels: &mut [Vec<f32>], target_peak: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::render_frozen_loop;
 
     fn make_test_signal(len: usize, freq_hz: f32, sample_rate: f32) -> Vec<f32> {
         (0..len).map(|i| (i as f32 / sample_rate * freq_hz * std::f32::consts::TAU).sin()).collect()
@@ -492,6 +558,21 @@ mod tests {
 
     fn off_params() -> FusionRenderParams {
         FusionRenderParams::default()
+    }
+
+    #[test]
+    fn large_fft_fusion_shares_one_hop_grid_across_sources() {
+        // A is long enough for a 32k window, B only for 8k: both must drop to
+        // the same size so Mix can combine loops of identical length.
+        let a = vec![make_test_signal((SAMPLE_RATE * 4.0) as usize, 220.0, SAMPLE_RATE)];
+        let b = vec![make_test_signal((SAMPLE_RATE * 0.4) as usize, 880.0, SAMPLE_RATE)];
+        for mode in [FusionMode::Mix, FusionMode::CrossSynth, FusionMode::Convolve, FusionMode::RingModulate] {
+            let fusion = FusionRenderParams { mode, fft_size: 32768, ..off_params() };
+            let out = render_fused_loop(&a, &b, SAMPLE_RATE, 30.0, 100.0, 0.0, 0.0, &fusion, 20.0, 3.0, 60);
+            assert_eq!(out.channels[0].len(), out.channels[1].len());
+            assert_eq!(out.channels[0].len() % 4096, 0, "mode {:?}: not on the 8k hop grid", mode);
+            assert!(out.channels.iter().flatten().all(|s| s.is_finite()), "mode {:?}", mode);
+        }
     }
 
     #[test]

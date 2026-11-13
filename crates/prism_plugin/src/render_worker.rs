@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
-use prism_dsp::fusion::{effective_mode, render_fused_loop, FusionMode, FusionRenderParams};
+use prism_dsp::chain::{render_chain, ChainParams};
+use prism_dsp::fusion::{effective_mode, FusionRenderParams};
 use prism_dsp::render::LoopBufferData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -11,16 +12,10 @@ use std::thread::{self, JoinHandle};
 /// per-sample transforms, so they can't just be read on the audio thread. A
 /// single background thread renders on demand and publishes the result into
 /// a shared `ArcSwap` the audio thread reads lock-free.
-#[derive(Clone, Copy, PartialEq)]
-pub struct RenderRequest {
-    pub freeze_point_pct: f32,
-    pub volume_pct: f32,
-    pub tune_semitones: f32,
-    pub formant_shift_semitones: f32,
-    pub stereo_width_pct: f32,
-    pub loop_length_seconds: f32,
-    pub fusion: FusionRenderParams,
-}
+/// Every render-time parameter of the instrument chain (see
+/// `prism_dsp::chain`). `Copy + PartialEq` so identical back-to-back
+/// requests can be collapsed.
+pub type RenderRequest = ChainParams;
 
 /// A cheap-to-clone handle for asking the render worker to render again -
 /// separated from `RenderWorker` itself (which owns the thread and stops it
@@ -30,6 +25,9 @@ pub struct RenderRequest {
 #[derive(Clone)]
 pub struct RenderTrigger {
     pending: Arc<(Mutex<Option<RenderRequest>>, Condvar)>,
+    /// True from a request until the worker has published its result and
+    /// nothing newer is waiting - drives the editor's "Rendering..." chip.
+    busy: Arc<AtomicBool>,
 }
 
 impl RenderTrigger {
@@ -38,14 +36,20 @@ impl RenderTrigger {
     /// matters (a request sent before the worker thread even exists yet is
     /// simply the first thing it processes once it does).
     pub fn new() -> Self {
-        Self { pending: Arc::new((Mutex::new(None), Condvar::new())) }
+        Self { pending: Arc::new((Mutex::new(None), Condvar::new())), busy: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Overwrites any not-yet-started pending request with this one.
     pub fn request_render(&self, request: RenderRequest) {
         let (lock, cvar) = &*self.pending;
+        self.busy.store(true, Ordering::Release);
         *lock.lock().unwrap() = Some(request);
         cvar.notify_one();
+    }
+
+    /// Whether a render is queued or in progress.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
 }
 
@@ -92,10 +96,11 @@ impl RenderWorker {
         source: Arc<ArcSwap<Vec<Vec<f32>>>>,
         source_b: Arc<ArcSwap<Vec<Vec<f32>>>>,
         sample_rate: f32,
-        root_note: u8,
+        _root_note: u8,
         output: Arc<ArcSwap<LoopBufferData>>,
     ) -> Self {
         let pending = trigger.pending.clone();
+        let busy = trigger.busy.clone();
         let stop = Arc::new(AtomicBool::new(false));
 
         let pending_thread = pending.clone();
@@ -128,22 +133,13 @@ impl RenderWorker {
                 // no error surfaced anywhere - worse than just skipping one
                 // bad render and staying alive for the next request.
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    render_fused_loop(
-                        &current_source,
-                        &current_source_b,
-                        sample_rate,
-                        request.freeze_point_pct,
-                        request.volume_pct,
-                        request.tune_semitones,
-                        request.formant_shift_semitones,
-                        &effective_fusion,
-                        request.stereo_width_pct,
-                        request.loop_length_seconds,
-                        root_note,
-                    )
+                    render_chain(&RenderRequest { fusion: effective_fusion, ..request }, &current_source, &current_source_b, sample_rate)
                 })) {
                     Ok(rendered) => output.store(Arc::new(rendered)),
                     Err(_) => eprintln!("SpectralPrism: render worker panicked on a request - skipping this render"),
+                }
+                if lock.lock().unwrap().is_none() {
+                    busy.store(false, Ordering::Release);
                 }
             }
         });
@@ -167,6 +163,7 @@ impl Drop for RenderWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_dsp::fusion::FusionMode;
     use prism_dsp::render::{DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE};
     use std::time::{Duration, Instant};
 
@@ -209,13 +206,14 @@ mod tests {
         let _worker =
             RenderWorker::spawn(trigger.clone(), make_source(sample_rate, 1.0), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger.request_render(RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
         });
 
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish a render in time");
@@ -236,13 +234,14 @@ mod tests {
         let sample_rate = 48000.0;
         let trigger = RenderTrigger::new();
         trigger.request_render(RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
         });
 
         let output = Arc::new(ArcSwap::new(Arc::new(LoopBufferData {
@@ -272,13 +271,14 @@ mod tests {
         // these down rather than queueing every one of them.
         for freeze_point_pct in [10.0, 20.0, 30.0, 40.0, 50.0] {
             trigger.request_render(RenderRequest {
-                freeze_point_pct,
-                volume_pct: 100.0,
-                tune_semitones: 0.0,
-                formant_shift_semitones: 0.0,
+                freeze_point_a_pct: freeze_point_pct,
+                volume_a_pct: 100.0,
+                tune_a_semitones: 0.0,
+                formant_shift_a_semitones: 0.0,
                 stereo_width_pct: 0.0,
                 loop_length_seconds: DEFAULT_LOOP_SECONDS,
                 fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
             });
         }
 
@@ -306,13 +306,14 @@ mod tests {
         let trigger = RenderTrigger::new();
         let _worker = RenderWorker::spawn(trigger.clone(), source.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         let request = RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
         };
         trigger.request_render(request);
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the first render in time");
@@ -355,13 +356,14 @@ mod tests {
         // this must degrade to Off (plain Sample A) rather than panic on an
         // empty source.
         trigger.request_render(RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams { mode: FusionMode::Mix, ..FusionRenderParams::default() },
+            ..RenderRequest::default()
         });
 
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish a render in time");
@@ -390,13 +392,14 @@ mod tests {
         let _worker_a_only =
             RenderWorker::spawn(trigger_a_only.clone(), source_a.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger_a_only.request_render(RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
         });
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the A-alone render in time");
         let a_alone = output.load().channels[0].clone();
@@ -405,13 +408,14 @@ mod tests {
         let trigger_mix = RenderTrigger::new();
         let _worker_mix = RenderWorker::spawn(trigger_mix.clone(), source_a, source_b, sample_rate, DEFAULT_ROOT_NOTE, output.clone());
         trigger_mix.request_render(RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 0.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams { mode: FusionMode::Mix, mix_amount_pct: 100.0, ..FusionRenderParams::default() },
+            ..RenderRequest::default()
         });
         assert!(wait_for_render(&output, Duration::from_secs(2)), "worker did not publish the Mix render in time");
         let mixed = output.load().channels[0].clone();
@@ -442,26 +446,34 @@ mod tests {
         let _worker = RenderWorker::spawn(trigger.clone(), source_a.clone(), make_empty_source(), sample_rate, DEFAULT_ROOT_NOTE, output.clone());
 
         let request = RenderRequest {
-            freeze_point_pct: 50.0,
-            volume_pct: 100.0,
-            tune_semitones: 0.0,
-            formant_shift_semitones: 0.0,
+            freeze_point_a_pct: 50.0,
+            volume_a_pct: 100.0,
+            tune_a_semitones: 0.0,
+            formant_shift_a_semitones: 0.0,
             stereo_width_pct: 30.0,
             loop_length_seconds: DEFAULT_LOOP_SECONDS,
             fusion: FusionRenderParams::default(),
+            ..RenderRequest::default()
         };
         trigger.request_render(request);
         // Give the panicking request time to be picked up and fail - the
         // worker thread must not have died as a result.
         thread::sleep(Duration::from_millis(200));
-        assert!(output.load().channels.is_empty(), "a panicking render should not have published anything");
+        // `render_chain` now handles an empty source itself (a silent,
+        // zero-length passthrough) instead of panicking - either outcome is
+        // fine here as long as nothing audible was published.
+        assert!(output.load().channels.iter().all(|c| c.is_empty()), "an empty source must not publish audio");
 
         // A source swapped in *after* the panic, on a *new* request, should
         // still get rendered normally - proving the worker thread is still
         // alive and looping, not silently dead.
         source_a.store(Arc::new(vec![vec![0.1f32; (sample_rate * 1.0) as usize]]));
         trigger.request_render(request);
-        assert!(wait_for_render(&output, Duration::from_secs(2)), "worker thread appears to have died after the earlier panic");
+        let start = Instant::now();
+        while output.load().channels.first().is_none_or(|c| c.is_empty()) && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(output.load().channels.first().is_some_and(|c| !c.is_empty()), "worker thread appears to have died after the earlier request");
         assert_eq!(output.load().channels.len(), 2);
     }
 }

@@ -31,14 +31,15 @@
 
 use realfft::num_complex::Complex32;
 
-use crate::fft::{FreezeFft, HOP_SIZE};
+use crate::fft::FreezeFft;
 use crate::freeze::{analyze_freeze_point, FrozenSpectrum};
 use crate::fusion::{
     combine_spectra, effective_mode, render_fused_loop, FusionMode, FusionRenderParams,
 };
-use crate::render::{apply_formant_shift, LoopBufferData, MAX_LOOP_SECONDS, MIN_LOOP_SECONDS};
+use crate::render::{apply_formant_shift, loop_hops, render_fft_size, LoopBufferData, MAX_LOOP_SECONDS, MIN_LOOP_SECONDS};
 use crate::resample::apply_tune;
 use crate::resynth::ola_accumulate_circular;
+use crate::shimmer::{apply_low_cut, averaged_magnitude, render_shimmer, ShimmerParams};
 use crate::stereo::{decorrelation_spread, width_multiplier};
 use crate::window::{apply_window_in_place, sine_window};
 use std::f32::consts::TAU;
@@ -137,11 +138,15 @@ fn build_source_keyframes(
     volume: &[f32],
     formant: &[f32],
     num_hops: usize,
+    shimmer: &ShimmerParams,
 ) -> Vec<SourceKeyframe> {
     let k = KEYFRAMES.min(num_hops).max(2);
     let left = &channels[0];
     let right = channels.get(1);
     let mut out = Vec::with_capacity(k);
+    // Shimmer averaging is the expensive part; consecutive keyframes often
+    // share the same span (e.g. a 100% span, or only Volume modulated).
+    let mut shimmer_cache: Option<((u32, u32), (Vec<f32>, Vec<f32>))> = None;
     for j in 0..k {
         let hop = (j * num_hops / k).min(num_hops - 1);
         let fp = freeze[hop];
@@ -162,8 +167,26 @@ fn build_source_keyframes(
 
         let a_l = analyze_freeze_point(&tuned_l, fp, vol, fft);
         let a_r = analyze_freeze_point(&tuned_r, fp, vol, fft);
-        let mag_l = apply_formant_shift(a_l.mag, fo, fft);
-        let mag_r = apply_formant_shift(a_r.mag, fo, fft);
+        let (mag_l, mag_r) = if shimmer.enabled {
+            // Volume is folded in after the (cached) average: it is linear.
+            let key = (tu.to_bits(), if shimmer.span_pct >= 100.0 { 0 } else { fp.to_bits() });
+            let (avg_l, avg_r) = match &shimmer_cache {
+                Some((cached_key, mags)) if *cached_key == key => mags.clone(),
+                _ => {
+                    let mags = (
+                        averaged_magnitude(&tuned_l, fp, shimmer.span_pct, 100.0, fft),
+                        averaged_magnitude(&tuned_r, fp, shimmer.span_pct, 100.0, fft),
+                    );
+                    shimmer_cache = Some((key, mags.clone()));
+                    mags
+                }
+            };
+            let gain = (vol / 100.0).clamp(0.0, 1.0);
+            let scale = |m: Vec<f32>| -> Vec<f32> { m.into_iter().map(|x| x * gain).collect() };
+            (apply_formant_shift(scale(avg_l), fo, fft), apply_formant_shift(scale(avg_r), fo, fft))
+        } else {
+            (apply_formant_shift(a_l.mag, fo, fft), apply_formant_shift(a_r.mag, fo, fft))
+        };
         out.push(SourceKeyframe {
             mag_l,
             mag_r,
@@ -247,7 +270,8 @@ fn render_keyframed(
 ) -> (Vec<f32>, Vec<f32>) {
     let bins = fft.num_bins();
     let k = kfs.len();
-    let out_len = num_hops * HOP_SIZE;
+    let hop = fft.hop();
+    let out_len = num_hops * hop;
 
     // Mean advance per bin, then the correction that quantises it to a whole
     // number of cycles over the loop while leaving the total variation intact.
@@ -304,7 +328,7 @@ fn render_keyframed(
         }
         fft.inverse(&mut spectrum, &mut time);
         apply_window_in_place(&mut time, window);
-        ola_accumulate_circular(&mut accum_l, h * HOP_SIZE, &time);
+        ola_accumulate_circular(&mut accum_l, h * hop, &time);
 
         for bin in 0..bins {
             let ml = lerp(kj.mag_l[bin], kn.mag_l[bin], alpha);
@@ -316,20 +340,85 @@ fn render_keyframed(
         }
         fft.inverse(&mut spectrum, &mut time);
         apply_window_in_place(&mut time, window);
-        ola_accumulate_circular(&mut accum_r, h * HOP_SIZE, &time);
+        ola_accumulate_circular(&mut accum_r, h * hop, &time);
     }
     (accum_l, accum_r)
 }
 
-fn build_gain_track(track: &[f32], out_len: usize, num_hops: usize) -> Vec<f32> {
+/// Shimmer sibling of `render_keyframed`: the same wrapped keyframe
+/// magnitude schedule and per-hop Stereo Width, resynthesised with random
+/// phases at 4x overlap (`shimmer::render_shimmer`) instead of the
+/// phase-locked oscillator bank.
+fn render_keyframed_shimmer(
+    kfs: &[SourceKeyframe],
+    widths: &[f32],
+    num_hops: usize,
+    fft: &FreezeFft,
+    shimmer: &ShimmerParams,
+    sample_rate: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let k = kfs.len();
+    let out_len = num_hops * fft.hop();
+    let size = fft.size();
+    render_shimmer(
+        fft,
+        out_len,
+        shimmer.seed,
+        |f, frames, l, r| {
+            let pos = f as f32 * k as f32 / frames as f32;
+            let j = (pos.floor() as usize) % k;
+            let nx = (j + 1) % k;
+            let alpha = pos - pos.floor();
+            let hop = (f * num_hops / frames).min(num_hops - 1);
+            let w = width_multiplier(widths[hop]);
+            for bin in 0..l.len() {
+                let ml = lerp(kfs[j].mag_l[bin], kfs[nx].mag_l[bin], alpha);
+                let mr = lerp(kfs[j].mag_r[bin], kfs[nx].mag_r[bin], alpha);
+                l[bin] = ml;
+                r[bin] = ml + (mr - ml) * w;
+            }
+            apply_low_cut(l, shimmer.low_cut_hz, sample_rate, size);
+            apply_low_cut(r, shimmer.low_cut_hz, sample_rate, size);
+        },
+        |f, frames| width_multiplier(widths[(f * num_hops / frames).min(num_hops - 1)]),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_keyframed_any(
+    kfs: &[SourceKeyframe],
+    widths: &[f32],
+    num_hops: usize,
+    fft: &FreezeFft,
+    window: &[f32],
+    shimmer: &ShimmerParams,
+    sample_rate: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    if shimmer.enabled {
+        render_keyframed_shimmer(kfs, widths, num_hops, fft, shimmer, sample_rate)
+    } else {
+        render_keyframed(kfs, widths, num_hops, fft, window)
+    }
+}
+
+fn build_gain_track(track: &[f32], out_len: usize, num_hops: usize, hop_size: usize) -> Vec<f32> {
     // Amounts arrive as 0-100 percentages; combine helpers want 0-1.
     (0..out_len)
         .map(|s| {
-            let hop = (s / HOP_SIZE).min(num_hops - 1);
-            let frac = (s % HOP_SIZE) as f32 / HOP_SIZE as f32;
+            let hop = (s / hop_size).min(num_hops - 1);
+            let frac = (s % hop_size) as f32 / hop_size as f32;
             lerp(track[hop], track[(hop + 1) % num_hops], frac) / 100.0
         })
         .collect()
+}
+
+/// Shortest source a render analyses (B only counts when the mode uses it).
+fn shortest_source(source_a: &[Vec<f32>], source_b: &[Vec<f32>], mode: FusionMode) -> usize {
+    let a = source_a.iter().map(Vec::len).min().unwrap_or(0);
+    match source_b.iter().map(Vec::len).min() {
+        Some(b) if mode.needs_sample_b() => a.min(b),
+        _ => a,
+    }
 }
 
 fn combine_linear(a: &[f32], b: &[f32], t: &[f32]) -> Vec<f32> {
@@ -391,11 +480,17 @@ pub fn render_fused_modulated_loop(
         );
     }
 
-    let loop_seconds = params.loop_length_seconds.clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
-    let num_hops = ((loop_seconds * sample_rate) / HOP_SIZE as f32).round().max(1.0) as usize;
-    let out_len = num_hops * HOP_SIZE;
+    let mode = effective_mode(params.fusion.mode, source_b);
+    let fft_size = render_fft_size(
+        params.fusion.fft_size,
+        shortest_source(source_a, source_b, mode),
+        params.loop_length_seconds,
+        sample_rate,
+    );
+    let fft = FreezeFft::with_size(fft_size);
+    let num_hops = loop_hops(params.loop_length_seconds, sample_rate, fft.hop());
+    let out_len = num_hops * fft.hop();
     let root_note = params.root_note;
-    let fft = FreezeFft::new();
     let window = sine_window(fft.size());
 
     let track = |target: usize, base: f32| -> Vec<f32> {
@@ -421,22 +516,20 @@ pub fn render_fused_modulated_loop(
     let convolve = track(MOD_CONVOLVE_AMOUNT, params.fusion.convolve_amount_pct);
     let ring = track(MOD_RING_MOD_AMOUNT, params.fusion.ring_mod_amount_pct);
 
-    let mode = effective_mode(params.fusion.mode, source_b);
-
     // Pre-resynthesis Fusion: combine spectra per keyframe, then render once.
     if matches!(
         mode,
         FusionMode::CrossSynth | FusionMode::Convolve | FusionMode::SpectralMax | FusionMode::SpectralMin
     ) {
-        let a_kfs = build_source_keyframes(source_a, sample_rate, &fft, &freeze_a, &tune_a, &vol_a, &form_a, num_hops);
-        let b_kfs = build_source_keyframes(source_b, sample_rate, &fft, &freeze_b, &tune_b, &vol_b, &form_b, num_hops);
+        let a_kfs = build_source_keyframes(source_a, sample_rate, &fft, &freeze_a, &tune_a, &vol_a, &form_a, num_hops, &params.fusion.shimmer);
+        let b_kfs = build_source_keyframes(source_b, sample_rate, &fft, &freeze_b, &tune_b, &vol_b, &form_b, num_hops, &params.fusion.shimmer);
         let amount_track = match mode {
             FusionMode::CrossSynth => &cross,
             FusionMode::Convolve => &convolve,
             _ => &mix,
         };
         let combined = build_combined_keyframes(&a_kfs, &b_kfs, mode, amount_track, num_hops, &fft);
-        let (l, r) = render_keyframed(&combined, &width, num_hops, &fft, &window);
+        let (l, r) = render_keyframed_any(&combined, &width, num_hops, &fft, &window, &params.fusion.shimmer, sample_rate);
         let mut channels = vec![l, r];
         if mode == FusionMode::Convolve {
             // Match render_pre_resynth_fusion: normalise against plain A's own
@@ -451,6 +544,7 @@ pub fn render_fused_modulated_loop(
                 params.formant_shift_a_semitones,
                 &FusionRenderParams {
                     mode: FusionMode::Off,
+                    fft_size,
                     ..params.fusion
                 },
                 params.stereo_width_pct,
@@ -474,8 +568,8 @@ pub fn render_fused_modulated_loop(
 
     // Post-resynthesis (Off / Mix / Ring Modulate / Cycle): each source is
     // rendered independently, then combined with a per-sample amount.
-    let a_kfs = build_source_keyframes(source_a, sample_rate, &fft, &freeze_a, &tune_a, &vol_a, &form_a, num_hops);
-    let (al, ar) = render_keyframed(&a_kfs, &width, num_hops, &fft, &window);
+    let a_kfs = build_source_keyframes(source_a, sample_rate, &fft, &freeze_a, &tune_a, &vol_a, &form_a, num_hops, &params.fusion.shimmer);
+    let (al, ar) = render_keyframed_any(&a_kfs, &width, num_hops, &fft, &window, &params.fusion.shimmer, sample_rate);
     if mode == FusionMode::Off {
         return LoopBufferData {
             channels: vec![al, ar],
@@ -484,12 +578,12 @@ pub fn render_fused_modulated_loop(
         };
     }
 
-    let b_kfs = build_source_keyframes(source_b, sample_rate, &fft, &freeze_b, &tune_b, &vol_b, &form_b, num_hops);
-    let (bl, br) = render_keyframed(&b_kfs, &width, num_hops, &fft, &window);
+    let b_kfs = build_source_keyframes(source_b, sample_rate, &fft, &freeze_b, &tune_b, &vol_b, &form_b, num_hops, &params.fusion.shimmer);
+    let (bl, br) = render_keyframed_any(&b_kfs, &width, num_hops, &fft, &window, &params.fusion.shimmer, sample_rate);
 
     match mode {
         FusionMode::Mix => {
-            let t = build_gain_track(&mix, out_len, num_hops);
+            let t = build_gain_track(&mix, out_len, num_hops, fft.hop());
             let cl = combine_linear(&al, &bl, &t);
             let cr = combine_linear(&ar, &br, &t);
             LoopBufferData {
@@ -499,7 +593,7 @@ pub fn render_fused_modulated_loop(
             }
         }
         FusionMode::RingModulate => {
-            let t = build_gain_track(&ring, out_len, num_hops);
+            let t = build_gain_track(&ring, out_len, num_hops, fft.hop());
             let target_peak = al
                 .iter()
                 .chain(ar.iter())
@@ -571,11 +665,14 @@ pub fn render_fused_loop_length_modulated_loop(
 
     let root_note = params.root_note;
     let mode = effective_mode(params.fusion.mode, source_b);
-    let base_seconds = params
-        .loop_length_seconds
-        .clamp(MIN_LOOP_SECONDS, MAX_LOOP_SECONDS);
-    let num_hops = ((base_seconds * sample_rate) / HOP_SIZE as f32).round().max(1.0) as usize;
-    let super_len = num_hops * HOP_SIZE;
+    let base_size = render_fft_size(
+        params.fusion.fft_size,
+        shortest_source(source_a, source_b, mode),
+        params.loop_length_seconds,
+        sample_rate,
+    );
+    let num_hops = loop_hops(params.loop_length_seconds, sample_rate, base_size / 2);
+    let super_len = num_hops * (base_size / 2);
 
     let segments = num_segments.clamp(1, num_points.max(1));
     let value = |target: usize, base: f32, point: usize| -> f32 {
@@ -610,6 +707,8 @@ pub fn render_fused_loop_length_modulated_loop(
             ),
             convolve_amount_pct: value(MOD_CONVOLVE_AMOUNT, params.fusion.convolve_amount_pct, point),
             ring_mod_amount_pct: value(MOD_RING_MOD_AMOUNT, params.fusion.ring_mod_amount_pct, point),
+            fft_size: params.fusion.fft_size,
+            shimmer: params.fusion.shimmer,
         };
         let rendered = render_fused_loop(
             source_a,
@@ -753,6 +852,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shimmer_renders_every_mode_static_and_modulated() {
+        let shimmer = ShimmerParams { enabled: true, span_pct: 100.0, low_cut_hz: 110.0, seed: 5 };
+        let modes = [
+            FusionMode::Off,
+            FusionMode::Mix,
+            FusionMode::CrossSynth,
+            FusionMode::Convolve,
+            FusionMode::RingModulate,
+            FusionMode::SpectralMax,
+            FusionMode::SpectralMin,
+            FusionMode::Cycle,
+        ];
+        for mode in modes {
+            let mut params = base_params(mode);
+            params.fusion.shimmer = shimmer;
+            let plain = render_fused_loop(
+                &source_a(),
+                &source_b(),
+                SAMPLE_RATE,
+                params.freeze_point_a_pct,
+                params.volume_a_pct,
+                params.tune_a_semitones,
+                params.formant_shift_a_semitones,
+                &params.fusion,
+                params.stereo_width_pct,
+                params.loop_length_seconds,
+                params.root_note,
+            );
+            let n = 16;
+            let mut points = constant_points(&params, n);
+            // Sweep the freeze point so the keyframed shimmer path runs.
+            for i in 0..n {
+                points[MOD_FREEZE_POINT_A * n + i] = 10.0 + 80.0 * i as f32 / n as f32;
+            }
+            let modulated = render_fused_modulated_loop(
+                &source_a(),
+                &source_b(),
+                SAMPLE_RATE,
+                &params,
+                &points,
+                n,
+                1 << MOD_FREEZE_POINT_A,
+            );
+            for (label, out) in [("plain", &plain), ("modulated", &modulated)] {
+                assert_eq!(out.channels.len(), 2, "{:?} {}", mode, label);
+                assert_eq!(out.channels[0].len(), plain.channels[0].len(), "{:?} {}", mode, label);
+                assert!(out.channels.iter().flatten().all(|s| s.is_finite()), "{:?} {}", mode, label);
+                let peak = out.channels.iter().flatten().fold(0.0f32, |m, &s| m.max(s.abs()));
+                assert!(peak > 1e-3, "{:?} {} is silent", mode, label);
+            }
+            // Shimmer differs from the classic freeze.
+            let classic = render_fused_loop(
+                &source_a(),
+                &source_b(),
+                SAMPLE_RATE,
+                params.freeze_point_a_pct,
+                params.volume_a_pct,
+                params.tune_a_semitones,
+                params.formant_shift_a_semitones,
+                &FusionRenderParams { shimmer: ShimmerParams::default(), ..params.fusion },
+                params.stereo_width_pct,
+                params.loop_length_seconds,
+                params.root_note,
+            );
+            assert_ne!(classic.channels[0], plain.channels[0], "{:?}", mode);
+        }
+    }
+
     /// Fills every target's control points with the matching scalar, so the
     /// modulated path should reproduce the plain render closely.
     fn constant_points(params: &ModulationParams, n: usize) -> Vec<f32> {
@@ -785,6 +953,28 @@ mod tests {
         (0..n)
             .map(|i| base + delta * (i as f32 / n as f32 * TAU).sin())
             .collect()
+    }
+
+    #[test]
+    fn freeze_point_scan_works_at_every_fft_size() {
+        // The Paulstretch-style drone: a slow freeze-point ramp across the loop.
+        let long_a = vec![make_signal((SAMPLE_RATE * 6.0) as usize, 220.0)];
+        let n = 64;
+        for &size in crate::fft::FFT_SIZES.iter() {
+            let mut params = base_params(FusionMode::Off);
+            params.loop_length_seconds = 4.0;
+            params.fusion.fft_size = size;
+            let mut points = constant_points(&params, n);
+            for (i, p) in points[MOD_FREEZE_POINT_A * n..(MOD_FREEZE_POINT_A + 1) * n].iter_mut().enumerate() {
+                *p = 10.0 + 80.0 * i as f32 / n as f32;
+            }
+            let out = render_fused_modulated_loop(&long_a, &[], SAMPLE_RATE, &params, &points, n, 1 << MOD_FREEZE_POINT_A);
+            let len = out.channels[0].len();
+            assert_eq!(len % (size / 2), 0, "size {}", size);
+            assert!((len as f32 / SAMPLE_RATE - 4.0).abs() < size as f32 / SAMPLE_RATE, "size {}", size);
+            assert!(out.channels.iter().flatten().all(|s| s.is_finite()), "size {}", size);
+            assert!(out.channels[0].iter().any(|s| s.abs() > 1e-3), "size {} is silent", size);
+        }
     }
 
     #[test]

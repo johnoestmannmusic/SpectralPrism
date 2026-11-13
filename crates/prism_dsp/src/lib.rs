@@ -5,17 +5,25 @@
 //! algorithm from src/0006/index.html's Spectral Fusion "Freeze" feature.
 
 pub mod analysis;
+pub mod chain;
+pub mod chord;
+pub mod chorus;
 pub mod envelope;
 pub mod fft;
+pub mod filter;
+pub mod fm_transform;
 pub mod formant;
 pub mod freeze;
 pub mod fusion;
+pub mod microtextures;
+pub mod modroute;
 pub mod modulate;
 pub mod percussion;
 pub mod phase_advance;
 pub mod render;
 pub mod resample;
 pub mod resynth;
+pub mod shimmer;
 pub mod stereo;
 pub mod voice;
 pub mod window;

@@ -38,7 +38,7 @@ pub enum NoiseColor {
 
 /// Percussion parameters for the post-fusion stage. All percentages are
 /// user-facing 0-100 values, matching the other SpectralPrism controls.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PercussionParams {
     pub noise_amount_pct: f32,
     pub noise_color: NoiseColor,

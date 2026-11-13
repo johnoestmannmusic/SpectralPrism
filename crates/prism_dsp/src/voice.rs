@@ -1,9 +1,15 @@
+use crate::chord::{chord_voices, ChordSettings};
+use crate::chorus::{Chorus, ChorusSettings};
 use crate::envelope::AdsrEnvelope;
+use crate::filter::{FilterSettings, VoiceFilter};
 use crate::render::LoopBufferData;
 use crate::resample::{playback_rate, sample_stereo_at, PlaybackReader};
 use std::sync::Arc;
 
-pub const MAX_VOICES: usize = 16;
+/// Size of the fixed voice pool. 32 (rather than one voice per finger) so
+/// Chord mode - up to 16 voices per played note - still leaves room for
+/// release tails and a second chord.
+pub const MAX_VOICES: usize = 32;
 pub const ATTACK_MS: f32 = 10.0;
 pub const DECAY_MS: f32 = 100.0;
 pub const SUSTAIN_LEVEL: f32 = 1.0;
@@ -21,6 +27,9 @@ pub const DEFAULT_VELOCITY_SENSITIVITY: f32 = 1.0;
 /// Below this level, `soft_limit` is exact identity - only signals that
 /// would otherwise exceed it are affected.
 pub const SOFT_LIMIT_THRESHOLD: f32 = 0.9;
+/// Fade applied when a voice is choked (mono mode / retrigger) instead of a
+/// hard cut, which would click.
+pub const CHOKE_FADE_MS: f32 = 3.0;
 
 /// Soft-knee limiter applied as the final safety stage on the mixed output
 /// (see `process_block`): identity below `SOFT_LIMIT_THRESHOLD`, smoothly
@@ -106,11 +115,60 @@ impl Default for AdsrSettings {
     }
 }
 
+/// How a voice reads the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackMode {
+    /// Wrap around forever (frozen loops, looped samples).
+    Loop,
+    /// Bounce back and forth between the buffer's ends.
+    PingPong,
+    /// Play once and stop at the end (percussion hits, plain samples).
+    OneShot,
+}
+
+/// Real-time playback settings (the tracker's Sampler/Polyphony/Vibrato
+/// controls). Defaults reproduce the plugin's original behaviour exactly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoiceSettings {
+    pub playback: PlaybackMode,
+    /// Whole-instrument transpose in semitones (real-time, like pitch bend).
+    pub transpose_semitones: f32,
+    /// Fine tune in cents (real-time).
+    pub fine_cents: f32,
+    /// Vibrato LFO rate (Hz) and depth (semitones, 0 = off).
+    pub vibrato_hz: f32,
+    pub vibrato_semitones: f32,
+    /// false = monophonic: a new note releases (or, with `choke`, cuts) the previous one.
+    pub polyphonic: bool,
+    /// Maximum simultaneously sounding voices (1..=MAX_VOICES).
+    pub voice_cap: usize,
+    /// A new note cuts the previous voice (mono) / the same note (poly)
+    /// with a short fade instead of letting its release tail ring.
+    pub choke: bool,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            playback: PlaybackMode::Loop,
+            transpose_semitones: 0.0,
+            fine_cents: 0.0,
+            vibrato_hz: 6.0,
+            vibrato_semitones: 0.0,
+            polyphonic: true,
+            voice_cap: MAX_VOICES,
+            choke: false,
+        }
+    }
+}
+
 pub struct Voice {
     pub id: i32,
     pub note: u8,
     pub channel: u8,
     pub gain: f32,
+    /// Playback rate relative to the buffer's root note (chord interval
+    /// included; transpose/fine/bend/vibrato are applied on top per block).
     pub rate: f64,
     pub reader: PlaybackReader,
     pub env: AdsrEnvelope,
@@ -120,6 +178,81 @@ pub struct Voice {
     /// playing, only for the next one triggered. `-1.0` = full left, `0.0`
     /// = center, `1.0` = full right.
     pub pan: f32,
+    /// +1.0 forwards, -1.0 backwards (ping-pong).
+    direction: f64,
+    /// Strum delay before this voice starts sounding, in samples.
+    start_delay: u32,
+    vibrato_phase: f32,
+    filter: VoiceFilter,
+    /// Choke fade: samples remaining / total (0 = not choking).
+    fade_remaining: u32,
+    fade_total: u32,
+    /// One-shot voice ran off the end of the buffer.
+    done: bool,
+}
+
+impl Voice {
+    fn release(&mut self) {
+        self.env.note_off();
+        self.filter.note_off();
+    }
+
+    fn choke(&mut self, fade_samples: u32) {
+        if self.fade_remaining == 0 {
+            self.fade_total = fade_samples.max(1);
+            self.fade_remaining = self.fade_total;
+        }
+    }
+
+    fn is_choking(&self) -> bool {
+        self.fade_remaining > 0
+    }
+
+    /// Reads one frame at the voice's position and advances it according
+    /// to `mode`. Returns `None` once a one-shot voice has run off the end.
+    #[inline]
+    fn read_and_advance(&mut self, left: &[f32], right: &[f32], rate: f64, mode: PlaybackMode) -> Option<(f32, f32)> {
+        let len = left.len();
+        if len == 0 {
+            return Some((0.0, 0.0));
+        }
+        match mode {
+            PlaybackMode::Loop => Some(self.reader.read_stereo_and_advance(left, right, rate)),
+            PlaybackMode::OneShot => {
+                let last = (len - 1) as f64;
+                if self.reader.read_pos >= last || self.reader.read_pos < 0.0 {
+                    return None;
+                }
+                let frame = sample_stereo_at(left, right, self.reader.read_pos);
+                self.reader.read_pos += rate;
+                Some(frame)
+            }
+            PlaybackMode::PingPong => {
+                if len < 2 {
+                    return Some((left[0], right[0]));
+                }
+                let last = (len - 1) as f64;
+                // A buffer swap can leave the position out of range.
+                let mut pos = self.reader.read_pos.clamp(0.0, last);
+                let frame = sample_stereo_at(left, right, pos);
+                pos += rate * self.direction;
+                // Reflect off either end (loop guards absurd rates).
+                for _ in 0..4 {
+                    if pos > last {
+                        pos = 2.0 * last - pos;
+                        self.direction = -1.0;
+                    } else if pos < 0.0 {
+                        pos = -pos;
+                        self.direction = 1.0;
+                    } else {
+                        break;
+                    }
+                }
+                self.reader.read_pos = pos.clamp(0.0, last);
+                Some(frame)
+            }
+        }
+    }
 }
 
 /// Fixed-size (no audio-thread allocation) polyphonic voice pool reading
@@ -134,6 +267,10 @@ pub struct Voice {
 /// between channels, not create it when the source has none. This manager
 /// just reads both of the buffer's (already width-shaped) channels in
 /// lockstep and mixes voices together.
+///
+/// Per voice: playback mode, vibrato, the resonant filter with its own
+/// envelope, strum delay (Chord mode) and choke fades. On the mix: the
+/// ensemble chorus, then the soft limiter.
 pub struct VoiceManager {
     voices: Vec<Option<Voice>>,
     sample_rate: f32,
@@ -172,9 +309,15 @@ pub struct VoiceManager {
     /// what real MIDI pitch bend does (it bends whatever is currently
     /// sounding on the channel).
     pitch_bend_semitones: f32,
+    voice_settings: VoiceSettings,
+    filter: FilterSettings,
+    chord: ChordSettings,
+    chorus_settings: ChorusSettings,
+    chorus: Chorus,
 }
 
 impl VoiceManager {
+    /// Allocates the voice pool and chorus delay line - call off the audio thread.
     pub fn new(sample_rate: f32, root_note: u8) -> Self {
         Self {
             voices: (0..MAX_VOICES).map(|_| None).collect(),
@@ -190,6 +333,11 @@ impl VoiceManager {
             pan_width: 0.0,
             pan_rng: SimpleRng::new(),
             pitch_bend_semitones: 0.0,
+            voice_settings: VoiceSettings::default(),
+            filter: FilterSettings::default(),
+            chord: ChordSettings::default(),
+            chorus_settings: ChorusSettings::default(),
+            chorus: Chorus::new(sample_rate),
         }
     }
 
@@ -219,21 +367,71 @@ impl VoiceManager {
         self.pitch_bend_semitones = semitones;
     }
 
-    pub fn note_on(&mut self, note: u8, channel: u8, velocity: f32, id: i32) {
-        let free_slot = self.find_free_slot();
+    /// Playback mode, tuning and vibrato apply to sounding voices from the
+    /// next block; polyphony settings apply from the next `note_on`.
+    pub fn set_voice_settings(&mut self, settings: VoiceSettings) {
+        self.voice_settings = settings;
+    }
 
-        let rate = playback_rate(note, self.root_note);
-        let mut env =
-            AdsrEnvelope::new(self.sample_rate, self.adsr.attack_ms, self.adsr.decay_ms, self.adsr.sustain_level, self.adsr.release_ms);
-        env.note_on();
+    /// Filter settings apply to every sounding voice from the next block.
+    pub fn set_filter(&mut self, filter: FilterSettings) {
+        self.filter = filter;
+    }
+
+    /// Applied from the next `note_on`.
+    pub fn set_chord(&mut self, chord: ChordSettings) {
+        self.chord = chord;
+    }
+
+    pub fn set_chorus(&mut self, chorus: ChorusSettings) {
+        self.chorus_settings = chorus;
+    }
+
+    fn choke_fade_samples(&self) -> u32 {
+        ((CHOKE_FADE_MS / 1000.0) * self.sample_rate).max(1.0) as u32
+    }
+
+    pub fn note_on(&mut self, note: u8, channel: u8, velocity: f32, id: i32) {
+        let vs = self.voice_settings;
+        let fade = self.choke_fade_samples();
+        // Monophonic: the previous note gives way (released, or faded out
+        // fast with choke). Poly + choke: only a retrigger of the same note does.
+        for v in self.voices.iter_mut().flatten() {
+            let same_note = v.note == note && v.channel == channel;
+            if !vs.polyphonic || same_note {
+                if vs.choke {
+                    v.choke(fade);
+                } else if !vs.polyphonic {
+                    v.release();
+                }
+            }
+        }
+
+        let base_rate = playback_rate(note, self.root_note);
         // Linearly blends between a fixed full gain (sensitivity 0.0, e.g.
         // a controller/player where velocity scaling isn't wanted) and the
         // original gain-equals-velocity behavior (sensitivity 1.0).
         let gain = 1.0 - self.velocity_sensitivity * (1.0 - velocity);
-        // Randomized once per voice within [pan_center - pan_width,
+        // Randomized once per note within [pan_center - pan_width,
         // pan_center + pan_width], clamped to stay in range - width 0.0
         // always lands exactly on pan_center (no randomization at all).
         let pan = (self.pan_center + self.pan_width * self.pan_rng.next_bipolar()).clamp(-1.0, 1.0);
+
+        if self.chord.enabled {
+            for cv in chord_voices(&self.chord) {
+                let rate = base_rate * 2f64.powf(cv.semitones as f64 / 12.0);
+                let delay = (cv.delay_sec * self.sample_rate) as u32;
+                self.spawn(note, channel, id, gain * cv.gain, rate, (pan + cv.pan).clamp(-1.0, 1.0), delay);
+            }
+        } else {
+            self.spawn(note, channel, id, gain, base_rate, pan, 0);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(&mut self, note: u8, channel: u8, id: i32, gain: f32, rate: f64, pan: f32, start_delay: u32) {
+        let mut env = AdsrEnvelope::new(self.sample_rate, self.adsr.attack_ms, self.adsr.decay_ms, self.adsr.sustain_level, self.adsr.release_ms);
+        env.note_on();
         let voice = Voice {
             id,
             note,
@@ -244,16 +442,28 @@ impl VoiceManager {
             env,
             triggered_at: self.clock,
             pan,
+            direction: 1.0,
+            start_delay,
+            vibrato_phase: 0.0,
+            filter: VoiceFilter::default(),
+            fade_remaining: 0,
+            fade_total: 0,
+            done: false,
         };
-
-        let slot = free_slot.unwrap_or_else(|| self.steal_slot());
+        let cap = self.voice_settings.voice_cap.clamp(1, MAX_VOICES);
+        // Choking voices are on their way out and don't count against the cap.
+        let sounding = self.voices.iter().flatten().filter(|v| !v.is_choking()).count();
+        let slot = match self.find_free_slot() {
+            Some(free) if sounding < cap => free,
+            _ => self.steal_slot(),
+        };
         self.voices[slot] = Some(voice);
     }
 
     pub fn note_off(&mut self, note: u8, channel: u8) {
         for v in self.voices.iter_mut().flatten() {
             if v.note == note && v.channel == channel {
-                v.env.note_off();
+                v.release();
             }
         }
     }
@@ -262,17 +472,21 @@ impl VoiceManager {
         for slot in self.voices.iter_mut() {
             *slot = None;
         }
+        self.chorus.reset();
     }
 
     fn find_free_slot(&self) -> Option<usize> {
         self.voices.iter().position(|v| v.is_none())
     }
 
-    /// Voice-stealing policy: prefer a voice already releasing (picking the
-    /// one with the lowest current level - closest to silent), else steal
-    /// the oldest currently-active voice (FIFO), which is audibly less
-    /// disruptive than cutting off whichever voice happens to be loudest.
+    /// Voice-stealing policy: prefer a voice already choking or releasing
+    /// (picking the one with the lowest current level - closest to silent),
+    /// else steal the oldest currently-active voice (FIFO), which is audibly
+    /// less disruptive than cutting off whichever voice happens to be loudest.
     fn steal_slot(&self) -> usize {
+        if let Some(i) = self.voices.iter().position(|v| v.as_ref().is_some_and(Voice::is_choking)) {
+            return i;
+        }
         let releasing_candidate = self
             .voices
             .iter()
@@ -355,8 +569,15 @@ impl VoiceManager {
         // wheel position, not audio-rate. Applied to *every* active voice's
         // read rate (real MIDI pitch bend affects whatever's currently
         // sounding on the channel, not just newly triggered notes - unlike
-        // gain/pan/ADSR, which are only decided once at `note_on`).
-        let bend_multiplier = 2.0_f64.powf(self.pitch_bend_semitones as f64 / 12.0);
+        // gain/pan/ADSR, which are only decided once at `note_on`). Transpose
+        // and fine tune ride along the same way.
+        let vs = self.voice_settings;
+        let block_semitones = self.pitch_bend_semitones + vs.transpose_semitones + vs.fine_cents / 100.0;
+        let bend_multiplier = 2.0_f64.powf(block_semitones as f64 / 12.0);
+        let vibrato_depth = vs.vibrato_semitones.max(0.0);
+        let vibrato_inc = std::f32::consts::TAU * vs.vibrato_hz.max(0.0) / self.sample_rate;
+        let filter = self.filter;
+        let sample_rate = self.sample_rate;
 
         for slot in self.voices.iter_mut() {
             let Some(voice) = slot else { continue };
@@ -375,8 +596,22 @@ impl VoiceManager {
             let left_gain = 1.0 - pan.max(0.0);
             let right_gain = 1.0 + pan.min(0.0);
             for i in 0..out_left.len() {
+                if voice.start_delay > 0 {
+                    voice.start_delay -= 1;
+                    continue;
+                }
+                let rate = if vibrato_depth > 0.0 {
+                    let semis = vibrato_depth * voice.vibrato_phase.sin();
+                    voice.vibrato_phase = (voice.vibrato_phase + vibrato_inc) % std::f32::consts::TAU;
+                    bent_rate * 2.0_f64.powf(semis as f64 / 12.0)
+                } else {
+                    bent_rate
+                };
                 let pos_before_advance = voice.reader.read_pos;
-                let (mut l, mut r) = voice.reader.read_stereo_and_advance(left_channel, right_channel, bent_rate);
+                let Some((mut l, mut r)) = voice.read_and_advance(left_channel, right_channel, rate, vs.playback) else {
+                    voice.done = true;
+                    break;
+                };
 
                 if let Some((outgoing_left, outgoing_right)) = crossfade {
                     let elapsed = self.crossfade_elapsed + i;
@@ -388,14 +623,26 @@ impl VoiceManager {
                     }
                 }
 
-                let level = voice.env.advance();
+                (l, r) = voice.filter.process(&filter, voice.rate as f32, sample_rate, l, r);
+
+                let mut level = voice.env.advance();
+                if voice.fade_remaining > 0 {
+                    level *= voice.fade_remaining as f32 / voice.fade_total as f32;
+                    voice.fade_remaining -= 1;
+                    if voice.fade_remaining == 0 {
+                        voice.done = true;
+                        break;
+                    }
+                }
                 out_left[i] += l * left_gain * level * voice.gain;
                 out_right[i] += r * right_gain * level * voice.gain;
             }
-            if voice.env.is_finished() {
+            if voice.done || voice.env.is_finished() {
                 *slot = None;
             }
         }
+
+        self.chorus.process(&self.chorus_settings, out_left, out_right);
 
         for i in 0..out_left.len() {
             out_left[i] = soft_limit(out_left[i]);
@@ -411,6 +658,59 @@ impl VoiceManager {
 
         self.clock += out_left.len() as u64;
     }
+}
+
+/// Renders one played note through a configured `VoiceManager` offline -
+/// the whole real-time end of the chain (playback mode, envelope, chord
+/// voices with their strum, vibrato, filter, chorus, soft limiter) - for
+/// WAV export. The note is held for `hold_samples` (or until every voice
+/// has ended by itself, e.g. one-shots), then released and rendered until
+/// every voice is silent (capped at `max_tail_samples`), plus a short tail
+/// for the chorus delay line. Trailing silence is trimmed. Returns stereo.
+pub fn render_note_offline(
+    voices: &mut VoiceManager,
+    buffer: &Arc<LoopBufferData>,
+    note: u8,
+    velocity: f32,
+    hold_samples: usize,
+    max_tail_samples: usize,
+) -> [Vec<f32>; 2] {
+    const BLOCK: usize = 256;
+    let mut out = [Vec::new(), Vec::new()];
+    let mut l = [0.0f32; BLOCK];
+    let mut r = [0.0f32; BLOCK];
+    let mut render = |voices: &mut VoiceManager, n: usize, out: &mut [Vec<f32>; 2]| {
+        voices.process_block(buffer, &mut l[..n], &mut r[..n]);
+        out[0].extend_from_slice(&l[..n]);
+        out[1].extend_from_slice(&r[..n]);
+    };
+
+    voices.note_on(note, 0, velocity, 0);
+    let mut held = 0;
+    while held < hold_samples && voices.active_voice_count() > 0 {
+        let n = BLOCK.min(hold_samples - held);
+        render(voices, n, &mut out);
+        held += n;
+    }
+    voices.note_off(note, 0);
+    let mut tail = 0;
+    while tail < max_tail_samples && voices.active_voice_count() > 0 {
+        render(voices, BLOCK, &mut out);
+        tail += BLOCK;
+    }
+    // Let the chorus delay line (<= 60 ms) ring out.
+    let chorus_tail = (0.06 * voices.sample_rate) as usize;
+    let mut done = 0;
+    while done < chorus_tail {
+        let n = BLOCK.min(chorus_tail - done);
+        render(voices, n, &mut out);
+        done += n;
+    }
+
+    let last = out[0].iter().zip(&out[1]).rposition(|(a, b)| a.abs() > 1e-5 || b.abs() > 1e-5).map_or(0, |i| i + 1);
+    out[0].truncate(last);
+    out[1].truncate(last);
+    out
 }
 
 #[cfg(test)]
@@ -908,5 +1208,152 @@ mod tests {
         assert!(pans.iter().all(|&p| (-0.5..=0.5).contains(&p)), "all pans should stay within the configured width: {pans:?}");
         let distinct = pans.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-6);
         assert!(distinct, "expected pan values to vary across notes, got all identical: {pans:?}");
+    }
+
+    fn ramp_buffer(len: usize) -> Arc<LoopBufferData> {
+        let ch: Vec<f32> = (0..len).map(|i| i as f32 / len as f32).collect();
+        Arc::new(LoopBufferData { channels: vec![ch.clone(), ch], sample_rate: 48000.0, root_note: DEFAULT_ROOT_NOTE })
+    }
+
+    fn run(vm: &mut VoiceManager, buf: &Arc<LoopBufferData>, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        vm.process_block(buf, &mut l, &mut r);
+        (l, r)
+    }
+
+    fn instant_adsr() -> AdsrSettings {
+        AdsrSettings { attack_ms: 0.0, decay_ms: 0.0, sustain_level: 1.0, release_ms: 0.0 }
+    }
+
+    #[test]
+    fn one_shot_voice_ends_at_the_buffer_end() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_voice_settings(VoiceSettings { playback: PlaybackMode::OneShot, ..VoiceSettings::default() });
+        vm.note_on(DEFAULT_ROOT_NOTE, 0, 1.0, 0);
+        let buf = ramp_buffer(256);
+        let (l, _) = run(&mut vm, &buf, 512);
+        assert_eq!(vm.active_voice_count(), 0);
+        assert!(l[300..].iter().all(|&v| v == 0.0), "nothing should play after the end");
+    }
+
+    #[test]
+    fn ping_pong_reverses_at_the_end() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(instant_adsr());
+        vm.set_voice_settings(VoiceSettings { playback: PlaybackMode::PingPong, ..VoiceSettings::default() });
+        vm.note_on(DEFAULT_ROOT_NOTE, 0, 1.0, 0);
+        let buf = ramp_buffer(100);
+        let (l, _) = run(&mut vm, &buf, 300);
+        // Rising for the first pass, falling for the second.
+        assert!(l[50] > l[10]);
+        assert!(l[150] < l[110]);
+        assert_eq!(vm.active_voice_count(), 1);
+    }
+
+    #[test]
+    fn transpose_an_octave_doubles_the_read_rate() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(instant_adsr());
+        vm.set_voice_settings(VoiceSettings { transpose_semitones: 12.0, playback: PlaybackMode::OneShot, ..VoiceSettings::default() });
+        vm.note_on(DEFAULT_ROOT_NOTE, 0, 1.0, 0);
+        let buf = ramp_buffer(1000);
+        let (l, _) = run(&mut vm, &buf, 600);
+        // (values near 1.0 pass through the soft limiter, hence > 0.9)
+        assert!((l[10] - 0.02).abs() < 1e-5 && l[499] > 0.9 && l[520] == 0.0, "an octave up should finish in half the time: {} {} {}", l[10], l[499], l[520]);
+    }
+
+    #[test]
+    fn monophonic_mode_releases_the_previous_note() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(instant_adsr());
+        vm.set_voice_settings(VoiceSettings { polyphonic: false, ..VoiceSettings::default() });
+        vm.note_on(60, 0, 1.0, 0);
+        vm.note_on(64, 0, 1.0, 1);
+        let buf = make_buffer();
+        run(&mut vm, &buf, 64);
+        assert_eq!(vm.active_voice_count(), 1);
+    }
+
+    #[test]
+    fn choke_fades_the_previous_voice_out_quickly() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(AdsrSettings { release_ms: 2000.0, ..instant_adsr() });
+        vm.set_voice_settings(VoiceSettings { polyphonic: false, choke: true, ..VoiceSettings::default() });
+        vm.note_on(60, 0, 1.0, 0);
+        vm.note_on(64, 0, 1.0, 1);
+        let buf = make_buffer();
+        run(&mut vm, &buf, 1024);
+        assert_eq!(vm.active_voice_count(), 1, "choked voice should be gone after the short fade despite a long release");
+    }
+
+    #[test]
+    fn voice_cap_limits_simultaneous_voices() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_voice_settings(VoiceSettings { voice_cap: 3, ..VoiceSettings::default() });
+        for n in 0..6 {
+            vm.note_on(60 + n, 0, 1.0, n as i32);
+        }
+        assert_eq!(vm.active_voice_count(), 3);
+    }
+
+    #[test]
+    fn chord_mode_spawns_one_voice_per_interval_with_strum() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(instant_adsr());
+        vm.set_chord(ChordSettings { enabled: true, strum_sec: 0.01, ..ChordSettings::default() });
+        vm.note_on(60, 0, 1.0, 0);
+        assert_eq!(vm.active_voice_count(), 3);
+        let buf = make_buffer();
+        let (l, _) = run(&mut vm, &buf, 1200);
+        // One voice (1/3 gain) sounds before the first strum delay elapses, all three after.
+        assert!((l[100] - 0.5 / 3.0).abs() < 1e-4, "got {}", l[100]);
+        assert!(l[1100] > l[100] * 2.5);
+        vm.note_off(60, 0);
+        run(&mut vm, &buf, 64);
+        assert_eq!(vm.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn filter_and_chorus_keep_output_finite() {
+        use crate::filter::FilterMode;
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_filter(FilterSettings { mode: FilterMode::Lowpass, resonance: 1.0, env_octaves: 4.0, ..FilterSettings::default() });
+        vm.set_chorus(ChorusSettings { enabled: true, ..ChorusSettings::default() });
+        vm.set_voice_settings(VoiceSettings { vibrato_semitones: 1.0, ..VoiceSettings::default() });
+        vm.note_on(60, 0, 1.0, 0);
+        vm.note_on(67, 0, 1.0, 1);
+        let buf = make_buffer();
+        for _ in 0..20 {
+            let (l, r) = run(&mut vm, &buf, 512);
+            assert!(l.iter().chain(r.iter()).all(|v| v.is_finite() && v.abs() <= 1.0));
+        }
+    }
+
+    #[test]
+    fn offline_note_includes_strummed_chord_and_release_then_trims_silence() {
+        let sr = 48000.0;
+        let mut vm = VoiceManager::new(sr, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(AdsrSettings { attack_ms: 1.0, decay_ms: 1.0, sustain_level: 1.0, release_ms: 100.0 });
+        vm.set_chord(ChordSettings { enabled: true, strum_sec: 0.05, ..ChordSettings::default() });
+        let buf = make_buffer();
+        let hold = 4800;
+        let [l, r] = render_note_offline(&mut vm, &buf, DEFAULT_ROOT_NOTE, 1.0, hold, 48_000);
+        assert_eq!(l.len(), r.len());
+        // Held 0.1 s, plus a release tail of roughly 100 ms (trimmed at -100 dB).
+        assert!(l.len() > hold + 2400 && l.len() < hold + 12_000, "len {}", l.len());
+        // Strum: the 3rd voice enters at 0.1 s, so the level steps up after the first strum gap.
+        assert!(l[3000] > l[1000] * 1.5, "{} vs {}", l[3000], l[1000]);
+        assert!(l.iter().chain(&r).all(|v| v.is_finite()));
+        assert_eq!(vm.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn offline_one_shot_stops_when_the_sample_ends() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(AdsrSettings { attack_ms: 0.0, decay_ms: 0.0, sustain_level: 1.0, release_ms: 1.0 });
+        vm.set_voice_settings(VoiceSettings { playback: PlaybackMode::OneShot, ..VoiceSettings::default() });
+        let [l, _] = render_note_offline(&mut vm, &make_buffer(), DEFAULT_ROOT_NOTE, 1.0, 1_000_000, 48_000);
+        assert!(l.len() <= 4096 + 10, "one-shot of a 4096-frame buffer rendered {} frames", l.len());
     }
 }
