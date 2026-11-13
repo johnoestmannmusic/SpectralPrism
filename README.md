@@ -90,7 +90,7 @@ This project's own source code (`crates/prism_dsp`, `crates/prism_plugin`,
 `crates/prism_cli`, `xtask`) is licensed under the [MIT License](LICENSE) -
 take and extend any of it however you'd like.
 
-One nuance worth knowing: producing a **VST3** build links against nih-plug's
+_Note 1: producing a **VST3** build links against nih-plug's
 VST3 bindings, which are an external dependency licensed under
 **GPL-3.0-or-later** by their own author (not by this project). As a result, a
 *compiled* VST3 binary built from this project is a combined work subject to
@@ -99,9 +99,9 @@ This doesn't affect the DSP core (`prism_dsp`) or the CLI harness
 (`prism_cli`), neither of which touch nih-plug's VST3 bindings, and it
 doesn't restrict what you can do with this project's own source code. It's
 specifically about the license terms that apply to a compiled, distributed
-VST3 binary.
+VST3 binary._
 
-_Note that as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://steinbergmedia.github.io/vst3_dev_portal/pages/Versions/Version+3.8.0.html). It appears that nih-plug has not been relicensed at this stage._
+_Note 2: as of 2025/10/20, Steinberg relicensed VST3 under MIT (see https://steinbergmedia.github.io/vst3_dev_portal/pages/Versions/Version+3.8.0.html). It appears that nih-plug has not been relicensed at this stage._
 
 
 ## AI Disclosure
