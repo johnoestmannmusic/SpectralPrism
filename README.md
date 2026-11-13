@@ -1,7 +1,6 @@
 # SpectralPrism
 
-<img width="1778" height="1094" alt="image" src="https://github.com/user-attachments/assets/aac628a5-045b-4f66-9d94-3a714c7d473f" />
-
+<img width="2108" height="1222" alt="image" src="https://github.com/user-attachments/assets/d7b4aae2-8133-4c17-8b19-2e42d8531d00" />
 
 A phase-vocoder "freeze" instrument: load a sample, freeze a spectral
 snapshot of it into a sustained, evolving pad/drone, and play it back
@@ -84,23 +83,6 @@ A standalone (non-plugin) build is also available for quick testing outside a DA
 ```sh
 cargo run --release --bin prism_plugin_standalone
 ```
-
-## Project structure
-
-- `crates/prism_dsp` - the DSP core (spectral freeze, fusion, shimmer,
-  modulation, FM transform, percussion, microtextures, the full render
-  `chain`, plus the real-time voice engine: playback modes, chord, filter,
-  chorus). Pure Rust, no dependency on nih-plug or any plugin format -
-  unit-tested independently of the plugin wrapper. SpectralPrism Tracker
-  vendors this crate (`scripts/vendor-prism-dsp.mjs`); this repo is its
-  source of truth.
-- `crates/prism_plugin` - the nih-plug/egui wrapper: parameters
-  (`params.rs`, `stage_params.rs`), presets (`preset.rs`), the signal-chain
-  editor (`editor.rs`, `stages.rs`, `widgets.rs`), the background render
-  worker, MIDI/voice handling, VST3/CLAP export.
-- `crates/prism_cli` - a WAV-in/WAV-out command-line harness for fast by-ear DSP
-  iteration without needing a plugin host.
-- `xtask` - the bundling tool (`cargo xtask bundle ...`), provided by nih-plug.
 
 ## License
 
