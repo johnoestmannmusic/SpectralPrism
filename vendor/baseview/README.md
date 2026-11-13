@@ -16,6 +16,12 @@ Patched here to fix three real, upstream X11-backend bugs (see `manage/KANBAN.md
    side effect of some *other* native dialog closing. Fixed in `src/x11/window.rs`: an
    `XSetInputFocus` call right after the window is created/mapped, plus real (non-panicking)
    implementations of `focus()`/`has_focus()`.
+   Then extended: focus was still only requested *once*, at window creation. Embedded in a
+   host, the window manager never gives a child window keyboard focus on click, so after
+   focus moved to the host (clicking the DAW, a native file dialog) text fields were
+   untypable again. `src/x11/event_loop.rs` now re-requests focus on any mouse-button press
+   when the window doesn't hold it (click-to-focus; `egui-baseview` has the same workaround,
+   but only compiled in on Windows).
 2. **X11 classic auto-repeat wasn't made "detectable".** Without
    `XkbSetDetectableAutoRepeat`, X11's core protocol can deliver a key release+press pair
    during ordinary auto-repeat that's indistinguishable from a genuine second keypress -

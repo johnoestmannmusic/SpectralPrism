@@ -3,6 +3,7 @@ use crate::chorus::{Chorus, ChorusSettings};
 use crate::envelope::AdsrEnvelope;
 use crate::filter::{FilterSettings, VoiceFilter};
 use crate::render::LoopBufferData;
+use crate::reverb::{Reverb, ReverbSettings};
 use crate::resample::{playback_rate, sample_stereo_at, PlaybackReader};
 use std::sync::Arc;
 
@@ -314,6 +315,16 @@ pub struct VoiceManager {
     chord: ChordSettings,
     chorus_settings: ChorusSettings,
     chorus: Chorus,
+    reverb_settings: ReverbSettings,
+    reverb: Reverb,
+    /// Output Volume (linear), applied after the chorus and *before* the
+    /// soft limiter - so turning it down really does keep the limiter out
+    /// of the signal. Ramped across each block from `output_gain_current`.
+    output_gain_target: f32,
+    output_gain_current: f32,
+    /// Peak of the last block going into the soft limiter (after Output
+    /// Volume). Above 1.0 the limiter is audibly squashing.
+    pre_limit_peak: f32,
 }
 
 impl VoiceManager {
@@ -338,6 +349,11 @@ impl VoiceManager {
             chord: ChordSettings::default(),
             chorus_settings: ChorusSettings::default(),
             chorus: Chorus::new(sample_rate),
+            reverb_settings: ReverbSettings::default(),
+            reverb: Reverb::new(sample_rate),
+            output_gain_target: 1.0,
+            output_gain_current: 1.0,
+            pre_limit_peak: 0.0,
         }
     }
 
@@ -381,6 +397,25 @@ impl VoiceManager {
     /// Applied from the next `note_on`.
     pub fn set_chord(&mut self, chord: ChordSettings) {
         self.chord = chord;
+    }
+
+    /// Output Volume as a linear gain; ramps in over the next block.
+    pub fn set_output_gain(&mut self, gain: f32) {
+        self.output_gain_target = gain.max(0.0);
+        // Nothing has played yet: start at the gain rather than ramping to it.
+        if self.clock == 0 {
+            self.output_gain_current = self.output_gain_target;
+        }
+    }
+
+    /// Peak level that went into the soft limiter during the last block.
+    /// Above 1.0 means the limiter was squashing (audible distortion).
+    pub fn pre_limit_peak(&self) -> f32 {
+        self.pre_limit_peak
+    }
+
+    pub fn set_reverb(&mut self, reverb: ReverbSettings) {
+        self.reverb_settings = reverb;
     }
 
     pub fn set_chorus(&mut self, chorus: ChorusSettings) {
@@ -473,6 +508,7 @@ impl VoiceManager {
             *slot = None;
         }
         self.chorus.reset();
+        self.reverb.reset();
     }
 
     fn find_free_slot(&self) -> Option<usize> {
@@ -643,11 +679,21 @@ impl VoiceManager {
         }
 
         self.chorus.process(&self.chorus_settings, out_left, out_right);
+        self.reverb.process(&self.reverb_settings, out_left, out_right);
 
+        // Output Volume, ramped across the block, then the safety limiter.
+        let n = out_left.len().max(1) as f32;
+        let (from, to) = (self.output_gain_current, self.output_gain_target);
+        let mut peak = 0.0f32;
         for i in 0..out_left.len() {
-            out_left[i] = soft_limit(out_left[i]);
-            out_right[i] = soft_limit(out_right[i]);
+            let gain = from + (to - from) * (i + 1) as f32 / n;
+            let (l, r) = (out_left[i] * gain, out_right[i] * gain);
+            peak = peak.max(l.abs()).max(r.abs());
+            out_left[i] = soft_limit(l);
+            out_right[i] = soft_limit(r);
         }
+        self.output_gain_current = to;
+        self.pre_limit_peak = peak;
 
         if self.outgoing_buffer.is_some() {
             self.crossfade_elapsed += out_left.len();
@@ -665,8 +711,9 @@ impl VoiceManager {
 /// voices with their strum, vibrato, filter, chorus, soft limiter) - for
 /// WAV export. The note is held for `hold_samples` (or until every voice
 /// has ended by itself, e.g. one-shots), then released and rendered until
-/// every voice is silent (capped at `max_tail_samples`), plus a short tail
-/// for the chorus delay line. Trailing silence is trimmed. Returns stereo.
+/// every voice is silent and the effects (chorus, reverb) have rung out -
+/// the release and effect tails share the `max_tail_samples` cap. Trailing
+/// silence is trimmed. Returns stereo.
 pub fn render_note_offline(
     voices: &mut VoiceManager,
     buffer: &Arc<LoopBufferData>,
@@ -698,13 +745,16 @@ pub fn render_note_offline(
         render(voices, BLOCK, &mut out);
         tail += BLOCK;
     }
-    // Let the chorus delay line (<= 60 ms) ring out.
-    let chorus_tail = (0.06 * voices.sample_rate) as usize;
-    let mut done = 0;
-    while done < chorus_tail {
-        let n = BLOCK.min(chorus_tail - done);
-        render(voices, n, &mut out);
-        done += n;
+    // Let the effects ring out (chorus delay line, reverb tail): keep going
+    // until 100 ms in a row stays below -80 dB, within the tail cap.
+    let quiet_needed = (0.1 * voices.sample_rate) as usize;
+    let mut quiet = 0;
+    while tail < max_tail_samples && quiet < quiet_needed {
+        let before = out[0].len();
+        render(voices, BLOCK, &mut out);
+        tail += BLOCK;
+        let loud = out[0][before..].iter().chain(&out[1][before..]).any(|v| v.abs() > 1e-4);
+        quiet = if loud { 0 } else { quiet + BLOCK };
     }
 
     let last = out[0].iter().zip(&out[1]).rposition(|(a, b)| a.abs() > 1e-5 || b.abs() > 1e-5).map_or(0, |i| i + 1);
@@ -1355,5 +1405,39 @@ mod tests {
         vm.set_voice_settings(VoiceSettings { playback: PlaybackMode::OneShot, ..VoiceSettings::default() });
         let [l, _] = render_note_offline(&mut vm, &make_buffer(), DEFAULT_ROOT_NOTE, 1.0, 1_000_000, 48_000);
         assert!(l.len() <= 4096 + 10, "one-shot of a 4096-frame buffer rendered {} frames", l.len());
+    }
+
+    #[test]
+    fn output_gain_is_applied_before_the_limiter() {
+        // Two overlapping full-level voices: ~1.0 into the limiter at unity.
+        let buf = make_buffer(); // constant 0.5
+        let mut hot = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        hot.set_adsr(AdsrSettings { attack_ms: 0.0, decay_ms: 0.0, sustain_level: 1.0, release_ms: 1.0 });
+        for n in [60, 60, 60] {
+            hot.note_on(n, 0, 1.0, 0);
+        }
+        let mut l = vec![0.0; 512];
+        let mut r = vec![0.0; 512];
+        hot.process_block(&buf, &mut l, &mut r);
+        assert!(hot.pre_limit_peak() > 1.4, "three voices at 0.5 go in hot: {}", hot.pre_limit_peak());
+
+        // -12 dB: the same notes no longer reach the limiter at all, so the
+        // output is an exact (undistorted) scaled copy.
+        hot.set_output_gain(0.25);
+        hot.process_block(&buf, &mut l, &mut r); // ramp block
+        hot.process_block(&buf, &mut l, &mut r);
+        assert!(hot.pre_limit_peak() < SOFT_LIMIT_THRESHOLD);
+        assert!((l[100] - 1.5 * 0.25).abs() < 1e-4, "{}", l[100]);
+    }
+
+    #[test]
+    fn offline_note_includes_the_reverb_tail() {
+        let mut vm = VoiceManager::new(48000.0, DEFAULT_ROOT_NOTE);
+        vm.set_adsr(AdsrSettings { attack_ms: 1.0, decay_ms: 1.0, sustain_level: 1.0, release_ms: 10.0 });
+        vm.set_reverb(ReverbSettings { enabled: true, decay_seconds: 2.0, mix_pct: 50.0, ..ReverbSettings::default() });
+        let [l, _] = render_note_offline(&mut vm, &make_buffer(), DEFAULT_ROOT_NOTE, 1.0, 4800, 48_000 * 20);
+        // 0.1 s note, then roughly a 2 s RT60 tail down to -80 dB.
+        assert!(l.len() > 48_000, "tail was cut short: {} samples", l.len());
+        assert!(l.len() < 48_000 * 6, "tail ran on: {} samples", l.len());
     }
 }

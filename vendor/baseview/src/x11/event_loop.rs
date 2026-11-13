@@ -231,6 +231,19 @@ impl EventLoop {
                     );
                 }
                 detail => {
+                    // Click-to-focus: when the editor is embedded in a host,
+                    // the window manager never gives a *child* window
+                    // keyboard focus on click, so once focus had moved to the
+                    // host (or a native file dialog), text fields could no
+                    // longer be typed into. Take focus back on any real
+                    // button press if we don't already hold it.
+                    // SpectralPrism fix - see this vendored copy's README.md.
+                    {
+                        let mut window = Window { inner: &self.window };
+                        if !window.has_focus() {
+                            window.focus();
+                        }
+                    }
                     let button_id = mouse_id(detail);
                     self.handler.on_event(
                         &mut crate::Window::new(Window { inner: &self.window }),

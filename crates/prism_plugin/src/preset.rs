@@ -793,4 +793,13 @@ mod preset_tests {
         assert!(old.stage_params.is_empty());
         assert!(old.chord_custom_intervals.is_none());
     }
+
+    #[test]
+    fn fm_source_params_are_saved_with_operator_suffixes() {
+        let captured = capture_stage_params(&PrismPluginParams::default());
+        for id in ["src_mode", "fms_length", "fms_stereo", "fms_wave_1", "fms_coarse_4", "fms_out_1", "fms_from2_1", "fms_from4_4"] {
+            assert!(captured.contains_key(id), "missing {id}");
+        }
+        assert_eq!(captured["fms_from2_1"], 25.0, "op 2 modulates op 1 by default");
+    }
 }

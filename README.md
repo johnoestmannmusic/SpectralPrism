@@ -27,13 +27,18 @@ The instrument is a signal chain, shown in the editor as a strip of stage
 cards - click a card to edit it, click its LED to switch it on or off:
 
 ```
-SOURCE ─▶ FM ─▶ SPECTRAL ─▶ PERCUSSION ─▶ TEXTURE ║ VOICE ─▶ CHORD ─▶ CHORUS
+SOURCE ─▶ FM ─▶ SPECTRAL ─▶ PERCUSSION ─▶ TEXTURE ║ VOICE ─▶ CHORD ─▶ POST-FX
 └──── rendered into the loop (a moment to update) ┘ └─ per note (instant) ─┘
 ```
 
 - **Source** - Sample A/B, plus trim and playback mode (Auto / Loop /
   Ping-pong / One-shot). With every render stage off the plugin is a plain
-  sampler.
+  sampler. Instead of Sample A you can switch to an **FM Synth** source: four
+  operators (Sine / Square / Triangle / Saw / Noise, ratio, fine, detune,
+  output) with a free routing matrix - any operator can modulate any other,
+  including itself (feedback). Its tone is rendered into a buffer that stands
+  in for the sample, so it runs through the rest of the chain the same way;
+  the loaded sample is kept for when you switch back.
 - **FM** - the sample phase-modulates a sine carrier (Direct / Stack / Pair
   algorithms, op2 feedback, index sway, stereo detune, sample-hold and
   quantise lo-fi).
@@ -51,7 +56,12 @@ SOURCE ─▶ FM ─▶ SPECTRAL ─▶ PERCUSSION ─▶ TEXTURE ║ VOICE ─�
   its own envelope and key follow.
 - **Chord** - each note plays a chord (11 shapes or custom intervals) with
   inversions, octaves, detune, strum and pan spread.
-- **Chorus** - stereo ensemble chorus on the whole instrument.
+- **Post-FX** - on the whole instrument: a stereo ensemble **Chorus**, then a
+  large **Reverb** (8-line feedback delay network; size, decay up to 60 s,
+  damping, pre-delay, width, wet/dry mix) for big ambient spaces.
+- **Output Volume** (bottom-left, always visible) - the master level, applied
+  before the safety limiter; its meter turns red when the limiter is
+  squashing the signal (turn it down).
 
 Every control explains itself in the info line when hovered. For layered
 sounds, run several instances of the plugin.

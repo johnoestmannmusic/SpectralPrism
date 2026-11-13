@@ -157,8 +157,8 @@ pub(crate) fn write_loop_buffer_wav(path: &Path, buffer: &LoopBufferData, normal
 /// The WAV export: one note at the root pitch (C4, where the rendered loop
 /// plays back unshifted) through the *whole* chain - the rendered loop
 /// played by a fresh voice engine configured exactly like live playback
-/// (envelope, chord voices and strum, vibrato, filter, chorus, soft
-/// limiter), then the Output Volume. A loop is held for one pass of the
+/// (envelope, chord voices and strum, vibrato, filter, chorus, reverb,
+/// Output Volume, soft limiter), rendered until the reverb tail has died away. A loop is held for one pass of the
 /// loop (plus the strum), a one-shot until it ends; either is then
 /// released and rendered until its tail has died away.
 pub(crate) fn render_played_note(params: &PrismPluginParams, buffer: &Arc<LoopBufferData>) -> LoopBufferData {
@@ -173,11 +173,12 @@ pub(crate) fn render_played_note(params: &PrismPluginParams, buffer: &Arc<LoopBu
         PlaybackMode::OneShot => (120.0 * sample_rate) as usize,
         PlaybackMode::Loop | PlaybackMode::PingPong => frames + strum_samples,
     };
-    let [mut left, mut right] = render_note_offline(&mut voices, buffer, buffer.root_note, 1.0, hold, (30.0 * sample_rate) as usize);
-    let gain = output_gain(params.output.volume.value());
-    for v in left.iter_mut().chain(right.iter_mut()) {
-        *v *= gain;
-    }
+    // Output Volume is applied by the voice engine (set above), before its limiter.
+    // Room for the release plus the reverb tail to fall to -80 dB (~1.4x its
+    // RT60), capped at two minutes.
+    let reverb = current_reverb_settings(params);
+    let tail_seconds = 30f32.max(if reverb.enabled { reverb.decay_seconds * 1.4 + reverb.predelay_seconds + 10.0 } else { 0.0 }).min(120.0);
+    let [left, right] = render_note_offline(&mut voices, buffer, buffer.root_note, 1.0, hold, (tail_seconds * sample_rate) as usize);
     LoopBufferData { channels: vec![left, right], sample_rate, root_note: buffer.root_note }
 }
 

@@ -66,8 +66,8 @@ pub(crate) struct PrismEditorState {
     pub(crate) selected_stage: Stage,
     /// Cached peaks of the output display.
     pub(crate) peak_cache: PeakCache,
-    /// Chord mode's Custom intervals text field buffer.
-    pub(crate) chord_text: String,
+    /// GUI-only panel state (chord text buffer, FM preview cache).
+    pub(crate) panel: PanelLocal,
     /// When the output last hit 0 dBFS - keeps the meter red for a moment.
     pub(crate) last_clip: Option<std::time::Instant>,
     /// Checkbox state in that prompt: whether to reduce
@@ -1005,7 +1005,7 @@ pub(crate) fn create(data: EditorData) -> Option<Box<dyn Editor>> {
                     // --- The selected stage's controls. ---
                     // Re-read every frame so a preset load shows up; edits in
                     // the text field write straight back (see `chord_panel`).
-                    state.chord_text = params.chord.custom_intervals.lock().unwrap().clone();
+                    state.panel.chord_text = params.chord.custom_intervals.lock().unwrap().clone();
                     let stage = state.selected_stage;
                     let cx = PanelCtx {
                         params: &params,
@@ -1017,7 +1017,7 @@ pub(crate) fn create(data: EditorData) -> Option<Box<dyn Editor>> {
                         name_a,
                         name_b,
                     };
-                    let actions = ui.scope(|ui| draw_stage_panel(ui, stage, &cx, &mut help, &mut state.chord_text)).inner;
+                    let actions = ui.scope(|ui| draw_stage_panel(ui, stage, &cx, &mut help, &mut state.panel)).inner;
                     if actions.load_a {
                         open_sample_dialog(state);
                     }

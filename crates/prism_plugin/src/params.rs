@@ -3,9 +3,11 @@
 
 use crate::render_worker::RenderRequest;
 pub(crate) use crate::stage_params::*;
-use prism_dsp::chain::ChainParams;
+use prism_dsp::chain::{ChainParams, SourceKind};
+use prism_dsp::fm_synth::{FmOperator, FmSynthParams, OpWave, OPS as FM_OPS};
 use prism_dsp::chord::{parse_intervals_into, ChordSettings, ChordShape};
 use prism_dsp::chorus::ChorusSettings;
+use prism_dsp::reverb::ReverbSettings;
 use prism_dsp::filter::{FilterMode, FilterSettings};
 use prism_dsp::fm_transform::{FmAlgorithm, FmTransformParams};
 use prism_dsp::microtextures::MicroTextureParams as DspMicroTextureParams;
@@ -310,8 +312,14 @@ pub(crate) struct PrismPluginParams {
     pub(crate) chord: ChordParams,
     #[nested(group = "Chorus")]
     pub(crate) chorus: ChorusParams,
+    #[nested(group = "Reverb")]
+    pub(crate) reverb: ReverbParams,
     #[nested(group = "Output")]
     pub(crate) output: OutputParams,
+    #[nested(group = "FM Source")]
+    pub(crate) fm_source: FmSourceParams,
+    #[nested(array, group = "FM Source Operator")]
+    pub(crate) fm_ops: [FmOperatorParams; FM_OPS],
 }
 
 impl Default for PrismPluginParams {
@@ -446,7 +454,10 @@ impl Default for PrismPluginParams {
             filter: FilterParams::default(),
             chord: ChordParams::default(),
             chorus: ChorusParams::default(),
+            reverb: ReverbParams::default(),
             output: OutputParams::default(),
+            fm_source: FmSourceParams::default(),
+            fm_ops: std::array::from_fn(FmOperatorParams::for_op),
         }
     }
 }
@@ -477,6 +488,11 @@ pub(crate) fn current_render_request(params: &PrismPluginParams) -> RenderReques
         };
     }
     ChainParams {
+        source_kind: match params.source.mode.value() {
+            SourceModeParam::Sample => SourceKind::Sample,
+            SourceModeParam::FmSynth => SourceKind::FmSynth,
+        },
+        fm_synth: current_fm_synth(params),
         trim_start_sec: params.source.trim_start.value(),
         trim_end_sec: params.source.trim_end.value(),
 
@@ -590,7 +606,9 @@ pub(crate) fn current_voice_settings(params: &PrismPluginParams, chain: &ChainPa
             PlaybackModeParam::PingPong => PlaybackMode::PingPong,
             PlaybackModeParam::OneShot => PlaybackMode::OneShot,
             PlaybackModeParam::Auto => {
-                if chain.suggests_one_shot() || !chain.renders() {
+                // A plain sample plays once; the FM synth's tone sustains.
+                let plain_sample = !chain.renders() && chain.source_kind == SourceKind::Sample;
+                if chain.suggests_one_shot() || plain_sample {
                     PlaybackMode::OneShot
                 } else {
                     PlaybackMode::Loop
@@ -699,5 +717,45 @@ pub(crate) fn apply_realtime_settings(voices: &mut VoiceManager, params: &PrismP
     let chord = current_chord_settings(params, previous_chord);
     voices.set_chord(chord);
     voices.set_chorus(current_chorus_settings(params));
+    voices.set_reverb(current_reverb_settings(params));
+    voices.set_output_gain(output_gain(params.output.volume.value()));
     chord
+}
+
+/// The FM Synth source's settings.
+pub(crate) fn current_fm_synth(params: &PrismPluginParams) -> FmSynthParams {
+    FmSynthParams {
+        ops: std::array::from_fn(|i| {
+            let op = &params.fm_ops[i];
+            FmOperator {
+                wave: match op.wave.value() {
+                    OpWaveParam::Sine => OpWave::Sine,
+                    OpWaveParam::Square => OpWave::Square,
+                    OpWaveParam::Triangle => OpWave::Triangle,
+                    OpWaveParam::Saw => OpWave::Saw,
+                    OpWaveParam::Noise => OpWave::Noise,
+                },
+                coarse: op.coarse.value().clamp(0, 16) as u8,
+                fine_pct: op.fine.value(),
+                detune_cents: op.detune.value(),
+                output_pct: op.output.value(),
+                mod_from: std::array::from_fn(|j| op.from(j).value()),
+            }
+        }),
+        length_seconds: params.fm_source.length.value(),
+        stereo_spread_cents: params.fm_source.stereo.value(),
+    }
+}
+
+pub(crate) fn current_reverb_settings(params: &PrismPluginParams) -> ReverbSettings {
+    let r = &params.reverb;
+    ReverbSettings {
+        enabled: r.enabled.value(),
+        size_pct: r.size.value(),
+        decay_seconds: r.decay.value(),
+        damping_hz: r.damping.value(),
+        predelay_seconds: r.predelay.value(),
+        mix_pct: r.mix.value(),
+        width_pct: r.width.value(),
+    }
 }

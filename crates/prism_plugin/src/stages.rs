@@ -19,6 +19,8 @@ use arc_swap::ArcSwap;
 use nih_plug::prelude::*;
 use nih_plug_egui::egui;
 use prism_dsp::chord::{chord_intervals, ChordSettings};
+use prism_dsp::fm_synth::{render_fm_cycles, FmSynthParams};
+use prism_dsp::render::DEFAULT_ROOT_NOTE;
 use prism_dsp::percussion::{hat_preset, kick_preset, metal_preset, snare_preset, PercussionParams as DspPerc};
 use std::sync::Arc;
 
@@ -32,11 +34,11 @@ pub(crate) enum Stage {
     Texture,
     Voice,
     Chord,
-    Chorus,
+    PostFx,
 }
 
 impl Stage {
-    pub(crate) const ALL: [Stage; 8] = [Stage::Source, Stage::Fm, Stage::Spectral, Stage::Percussion, Stage::Texture, Stage::Voice, Stage::Chord, Stage::Chorus];
+    pub(crate) const ALL: [Stage; 8] = [Stage::Source, Stage::Fm, Stage::Spectral, Stage::Percussion, Stage::Texture, Stage::Voice, Stage::Chord, Stage::PostFx];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
@@ -47,21 +49,21 @@ impl Stage {
             Stage::Texture => "TEXTURE",
             Stage::Voice => "VOICE",
             Stage::Chord => "CHORD",
-            Stage::Chorus => "CHORUS",
+            Stage::PostFx => "POST-FX",
         }
     }
 
     /// Shown in the info line when no control is hovered.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Stage::Source => "Source: the sample(s) everything starts from. With every render stage off, the plugin is a plain sampler - trim and playback mode apply here.",
+            Stage::Source => "Source: what everything starts from - a loaded sample, or a 4-operator FM synth you design here (rendered into a buffer that stands in for the sample). With every render stage off, notes play it directly.",
             Stage::Fm => "FM: the sample phase-modulates a sine carrier at the played pitch before anything else, turning any sound into a metallic, bell-like or growling tone. Alone it transforms a hit; with Spectral on it feeds the freeze.",
             Stage::Spectral => "Spectral: freezes one instant of the sample into an endless, evolving loop - optionally fused with Sample B and swept by modulation routes. The heart of SpectralPrism.",
             Stage::Percussion => "Percussion: re-synthesises whatever the earlier stages produced as a short drum hit - modal body, noise, transient and a pitch sweep. Pick a preset as a starting point.",
             Stage::Texture => "Texture (MicroTextures): granular post-processing - scatters short grains of the result in time, pitch and space, with retrigger stutters, a formant filter bank and lo-fi crush.",
             Stage::Voice => "Voice: how each note plays the rendered loop - amp envelope, tuning, vibrato, polyphony and a resonant filter with its own envelope. Changes here are instant (no re-render).",
             Stage::Chord => "Chord: every note you play becomes a whole chord - choose a shape, voice it with inversions and octaves, and strum or detune it.",
-            Stage::Chorus => "Chorus: a stereo ensemble effect on the whole instrument - slowly modulated delays thicken and widen the sound.",
+            Stage::PostFx => "Post-FX: effects on the whole instrument after the voices - a stereo ensemble Chorus to thicken and widen, then a large Reverb (up to a minute of decay) for huge ambient spaces. Both are instant (no re-render).",
         }
     }
 
@@ -73,13 +75,16 @@ impl Stage {
             Stage::Percussion => Some(&p.percussion.enabled),
             Stage::Texture => Some(&p.micro.enabled),
             Stage::Chord => Some(&p.chord.enabled),
-            Stage::Chorus => Some(&p.chorus.enabled),
-            Stage::Source | Stage::Voice => None,
+            // Post-FX has one switch per effect, in its panel.
+            Stage::Source | Stage::Voice | Stage::PostFx => None,
         }
     }
 
     pub(crate) fn is_on(self, p: &PrismPluginParams) -> bool {
-        self.enable_param(p).is_none_or(BoolParam::value)
+        match self {
+            Stage::PostFx => p.chorus.enabled.value() || p.reverb.enabled.value(),
+            _ => self.enable_param(p).is_none_or(BoolParam::value),
+        }
     }
 }
 
@@ -93,6 +98,10 @@ pub(crate) fn summary(stage: Stage, p: &PrismPluginParams, sample_a: Option<&str
         return "off".to_string();
     }
     match stage {
+        Stage::Source if p.source.mode.value() == SourceModeParam::FmSynth => {
+            let n = current_fm_synth(p).active_ops();
+            format!("FM synth · {n} op{}", if n == 1 { "" } else { "s" })
+        }
         Stage::Source => {
             let name = sample_a.unwrap_or("placeholder tone");
             let renders = p.spectral.enabled.value() || p.fm.enabled.value() || p.percussion.enabled.value() || p.micro.enabled.value();
@@ -133,7 +142,16 @@ pub(crate) fn summary(stage: Stage, p: &PrismPluginParams, sample_a: Option<&str
             }
         }
         Stage::Chord => variant_name(p.chord.shape.value()).to_lowercase(),
-        Stage::Chorus => format!("mix {:.0}%", p.chorus.mix.value()),
+        Stage::PostFx => {
+            let mut parts = Vec::new();
+            if p.chorus.enabled.value() {
+                parts.push("chorus".to_string());
+            }
+            if p.reverb.enabled.value() {
+                parts.push(format!("reverb {:.0}s", p.reverb.decay.value()));
+            }
+            parts.join(" · ")
+        }
     }
 }
 
@@ -243,6 +261,15 @@ pub(crate) struct PanelCtx<'a> {
     pub(crate) name_b: Option<String>,
 }
 
+/// GUI-only state the panels keep between frames.
+#[derive(Default)]
+pub(crate) struct PanelLocal {
+    /// Chord mode's Custom intervals text field buffer.
+    pub(crate) chord_text: String,
+    /// FM Synth source preview: the params it was rendered for, and the samples.
+    fm_preview: Option<(FmSynthParams, Vec<f32>)>,
+}
+
 /// What a panel asks the editor to do (file dialogs live in the editor).
 #[derive(Default)]
 pub(crate) struct PanelActions {
@@ -251,7 +278,7 @@ pub(crate) struct PanelActions {
 }
 
 /// Draws the selected stage's panel.
-pub(crate) fn draw_stage_panel(ui: &mut egui::Ui, stage: Stage, cx: &PanelCtx, help: &mut Option<&'static str>, chord_text: &mut String) -> PanelActions {
+pub(crate) fn draw_stage_panel(ui: &mut egui::Ui, stage: Stage, cx: &PanelCtx, help: &mut Option<&'static str>, local: &mut PanelLocal) -> PanelActions {
     let mut actions = PanelActions::default();
     let p = cx.params;
     if let Some(param) = stage.enable_param(p) {
@@ -269,19 +296,144 @@ pub(crate) fn draw_stage_panel(ui: &mut egui::Ui, stage: Stage, cx: &PanelCtx, h
         }
     }
     match stage {
-        Stage::Source => source_panel(ui, cx, help, &mut actions),
+        Stage::Source => source_panel(ui, cx, help, &mut actions, local),
         Stage::Fm => fm_panel(ui, cx, help),
         Stage::Spectral => spectral_panel(ui, cx, help, &mut actions),
         Stage::Percussion => percussion_panel(ui, cx, help),
         Stage::Texture => texture_panel(ui, cx, help),
         Stage::Voice => voice_panel(ui, cx, help),
-        Stage::Chord => chord_panel(ui, cx, help, chord_text),
-        Stage::Chorus => chorus_panel(ui, cx, help),
+        Stage::Chord => chord_panel(ui, cx, help, &mut local.chord_text),
+        Stage::PostFx => post_fx_panel(ui, cx, help),
     }
     actions
 }
 
-fn source_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>, actions: &mut PanelActions) {
+fn source_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>, actions: &mut PanelActions, local: &mut PanelLocal) {
+    let (p, s, sc) = (cx.params, cx.setter, cx.scale);
+    let mode = p.source.mode.value();
+    ui.horizontal(|ui| {
+        ui.colored_label(COLOR_DIM, "Source A:");
+        for (choice, label, tip) in [
+            (SourceModeParam::Sample, "Sample", "Use the loaded sample (or the built-in placeholder tone)."),
+            (SourceModeParam::FmSynth, "FM Synth", "Design a tone with a 4-operator FM synth instead. The loaded sample is kept for when you switch back."),
+        ] {
+            let r = ui.selectable_label(mode == choice, label);
+            if r.clicked() && mode != choice {
+                s.begin_set_parameter(&p.source.mode);
+                s.set_parameter(&p.source.mode, choice);
+                s.end_set_parameter(&p.source.mode);
+            }
+            if r.hovered() {
+                *help = Some(tip);
+            }
+        }
+    });
+    ui.add_space(4.0 * sc);
+    match mode {
+        SourceModeParam::Sample => sample_source_panel(ui, cx, help, actions),
+        SourceModeParam::FmSynth => fm_source_panel(ui, cx, help, actions, local),
+    }
+}
+
+fn fm_source_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>, actions: &mut PanelActions, local: &mut PanelLocal) {
+    let (p, s, sc) = (cx.params, cx.setter, cx.scale);
+    let fm = current_fm_synth(p);
+    if local.fm_preview.as_ref().is_none_or(|(key, _)| *key != fm) {
+        let rate = if cx.sample_rate > 1000.0 { cx.sample_rate } else { 48_000.0 };
+        local.fm_preview = Some((fm, render_fm_cycles(&fm, rate, DEFAULT_ROOT_NOTE, 3)));
+    }
+    let total = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let left_w = (total - gap) * 0.27;
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(egui::vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            section(ui, "FM SYNTH", sc, |ui| {
+                draw_fm_routing(ui, &fm, sc);
+                ui.add_space(4.0 * sc);
+                let preview = local.fm_preview.as_ref().map(|(_, v)| v.as_slice()).unwrap_or(&[]);
+                let silent = preview.iter().all(|v| *v == 0.0);
+                draw_cycle_preview(ui, if silent { &[] } else { preview }, sc);
+                ui.add_space(4.0 * sc);
+                grid(ui, "fms_global", sc, |ui| {
+                    row(ui, "Length", &p.fm_source.length, s, "How long a buffer the synth renders. The later stages read it like a sample (Spectral picks its moment with Freeze Point).", help);
+                    row(ui, "Stereo Spread", &p.fm_source.stereo, s, "Detunes the whole synth apart between left and right, for width.", help);
+                    enum_row(ui, "Playback", &p.source.playback, s, "Auto sustains the FM tone (and plays Percussion hits once). Or force Loop, Ping-pong or One-shot.", help);
+                });
+                ui.add_space(2.0 * sc);
+                ui.horizontal(|ui| {
+                    ui.colored_label(COLOR_DIM, egui::RichText::new(format!("Sample B: {}", cx.name_b.as_deref().unwrap_or("none"))).small());
+                    if ui.small_button("Load B...").on_hover_text("Sample B is still used by Spectral Fusion.").clicked() {
+                        actions.load_b = true;
+                    }
+                });
+            });
+        });
+        ui.allocate_ui_with_layout(egui::vec2(total - left_w - gap, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            section(ui, "OPERATORS + ROUTING - each row is one operator; the right-hand boxes are how much each operator modulates it", sc, |ui| {
+                // Fit four sliders (plus their value boxes) into what's left
+                // after the label, wave menu and four matrix cells.
+                let col_gap = 8.0 * sc;
+                let fixed = 46.0 * sc + 84.0 * sc + 4.0 * (38.0 * sc + col_gap) + 10.0 * col_gap;
+                let value_box = 40.0 * sc;
+                let slider_w = ((ui.available_width() - fixed) / 4.0 - value_box - ui.spacing().item_spacing.x).clamp(30.0 * sc, 110.0 * sc);
+                egui::Grid::new("fms_ops").num_columns(10).spacing([col_gap, 6.0 * sc]).show(ui, |ui| {
+                    for h in ["", "Wave", "Ratio", "Fine", "Detune", "Output", "by 1", "by 2", "by 3", "by 4"] {
+                        ui.colored_label(COLOR_DIM, egui::RichText::new(h).small());
+                    }
+                    ui.end_row();
+                    for (i, op) in p.fm_ops.iter().enumerate() {
+                        let ratio = fm.ops[i].ratio();
+                        let ratio_text = format!("{ratio:.2}").trim_end_matches('0').trim_end_matches('.').to_string();
+                        let head = ui.vertical(|ui| {
+                            ui.label(format!("Op {}", i + 1));
+                            ui.colored_label(COLOR_DIM, egui::RichText::new(format!("x{ratio_text}")).small());
+                        });
+                        if head.response.hovered() {
+                            *help = Some("The operator's frequency is the played note times this ratio (Ratio, plus Fine).");
+                        }
+                        if enum_combo(ui, ("fms_wave", i), &op.wave, s, 84.0 * sc).hovered() {
+                            *help = Some("Operator waveform. Sine is classic FM; Square, Triangle and Saw are brighter; Noise ignores modulation and adds grit to whatever it feeds.");
+                        }
+                        for (param, tip) in [
+                            (&op.coarse as &dyn ParamSliderTarget, "Frequency ratio to the played note: x0.5 to x16. Whole-number ratios sound harmonic."),
+                            (&op.fine, "Adds a percentage to the ratio - e.g. x1 + 41% for bell-like inharmonic tones."),
+                            (&op.detune, "Fine detune in cents, for slow beating against the other operators."),
+                            (&op.output, "How much of this operator you hear. Operators with no output only modulate."),
+                        ] {
+                            if param.slider(ui, s, slider_w).hovered() {
+                                *help = Some(tip);
+                            }
+                        }
+                        for j in 0..prism_dsp::fm_synth::OPS {
+                            let r = matrix_cell(ui, op.from(j), s, i == j, sc);
+                            if r.hovered() {
+                                *help = Some(if i == j {
+                                    "Feedback: the operator modulating itself - from warm to buzzy to noisy. Drag up/down, double-click for 0."
+                                } else {
+                                    "How strongly the column's operator modulates this row's operator. Drag up/down, double-click for 0."
+                                });
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    });
+}
+
+/// Lets the operator grid treat Int and Float params alike.
+trait ParamSliderTarget {
+    fn slider(&self, ui: &mut egui::Ui, setter: &ParamSetter, width: f32) -> egui::Response;
+}
+
+impl<P: Param> ParamSliderTarget for P {
+    fn slider(&self, ui: &mut egui::Ui, setter: &ParamSetter, width: f32) -> egui::Response {
+        ui.add(nih_plug_egui::widgets::ParamSlider::for_param(self, setter).with_width(width))
+    }
+}
+
+fn sample_source_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>, actions: &mut PanelActions) {
     let (p, s, sc) = (cx.params, cx.setter, cx.scale);
     let renders = p.spectral.enabled.value() || p.fm.enabled.value() || p.percussion.enabled.value() || p.micro.enabled.value();
     ui.columns(3, |cols| {
@@ -699,27 +851,42 @@ fn chord_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>
     });
 }
 
-fn chorus_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>) {
+fn post_fx_panel(ui: &mut egui::Ui, cx: &PanelCtx, help: &mut Option<&'static str>) {
     let (p, s, sc) = (cx.params, cx.setter, cx.scale);
-    let c = &p.chorus;
+    let (c, r) = (&p.chorus, &p.reverb);
     ui.columns(3, |cols| {
-        section(&mut cols[0], "MOVEMENT", sc, |ui| {
-            grid(ui, "cho_a", sc, |ui| {
+        section(&mut cols[0], "CHORUS", sc, |ui| {
+            grid(ui, "postfx_chorus", sc, |ui| {
+                toggle_row(ui, "Chorus", &c.enabled, s, "A stereo ensemble: slowly modulated delays that thicken and widen the sound.", help);
                 row(ui, "Rate", &c.rate, s, "Speed of the delay modulation.", help);
                 row(ui, "Depth", &c.depth, s, "How far the delay time swings.", help);
                 row(ui, "Delay", &c.delay, s, "Base delay time.", help);
-            });
-        });
-        section(&mut cols[1], "BLEND", sc, |ui| {
-            grid(ui, "cho_b", sc, |ui| {
                 row(ui, "Mix", &c.mix, s, "Dry vs chorused signal.", help);
                 row(ui, "Spread", &c.spread, s, "Phase offset between left and right - 100% is the widest.", help);
             });
         });
-        section(&mut cols[2], "ABOUT", sc, |ui| {
+        section(&mut cols[1], "REVERB", sc, |ui| {
+            grid(ui, "postfx_reverb_a", sc, |ui| {
+                toggle_row(ui, "Reverb", &r.enabled, s, "A large stereo reverb after the chorus - from rooms to enormous ambient spaces.", help);
+                row(ui, "Mix (dry/wet)", &r.mix, s, "Wet/dry: 0% = only the dry sound, 100% = only the reverb. Around 30-50% for space, 70%+ for washes.", help);
+                row(ui, "Size", &r.size, s, "How big the space is - larger spreads the echoes further apart.", help);
+                row(ui, "Decay", &r.decay, s, "How long the tail takes to fade by 60 dB - up to a minute for endless ambient washes.", help);
+            });
+        });
+        section(&mut cols[2], "REVERB TONE", sc, |ui| {
+            grid(ui, "postfx_reverb_b", sc, |ui| {
+                row(ui, "Damping", &r.damping, s, "High frequencies above this die away faster in the tail - lower is darker and softer.", help);
+                row(ui, "Pre-delay", &r.predelay, s, "A gap before the reverb starts, keeping the dry attack clear.", help);
+                row(ui, "Width", &r.width, s, "Stereo width of the tail (0% = mono).", help);
+            });
+            ui.add_space(4.0 * sc);
             ui.add(
-                egui::Label::new(egui::RichText::new("Runs on the whole instrument after the voices are mixed, so it thickens chords and pads without a re-render.").color(COLOR_DIM).small())
-                    .wrap(),
+                egui::Label::new(
+                    egui::RichText::new("Both effects run on the whole instrument after the voices, so changes are instant. Long tails keep ringing after you let go - Export WAV waits for them to die away.")
+                        .color(COLOR_DIM)
+                        .small(),
+                )
+                .wrap(),
             );
         });
     });

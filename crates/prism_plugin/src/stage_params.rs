@@ -288,10 +288,42 @@ pub(crate) enum ChordShapeParam {
     Custom,
 }
 
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceModeParam {
+    #[id = "sample"]
+    #[name = "Sample"]
+    Sample,
+    #[id = "fm-synth"]
+    #[name = "FM Synth"]
+    FmSynth,
+}
+
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpWaveParam {
+    #[id = "sine"]
+    #[name = "Sine"]
+    Sine,
+    #[id = "square"]
+    #[name = "Square"]
+    Square,
+    #[id = "triangle"]
+    #[name = "Triangle"]
+    Triangle,
+    #[id = "saw"]
+    #[name = "Saw"]
+    Saw,
+    #[id = "noise"]
+    #[name = "Noise"]
+    Noise,
+}
+
 // ---------------------------------------------------------- stage params ---
 
 #[derive(Params)]
 pub(crate) struct SourceParams {
+    /// Sample A, or the FM synth rendered into a buffer in its place.
+    #[id = "src_mode"]
+    pub(crate) mode: EnumParam<SourceModeParam>,
     /// Trim applies to the plain sampler (Spectral/FM/Percussion/Texture all
     /// off); the spectral stages read the whole sample, as in the tracker.
     #[id = "src_trim_start"]
@@ -305,6 +337,7 @@ pub(crate) struct SourceParams {
 impl Default for SourceParams {
     fn default() -> Self {
         Self {
+            mode: EnumParam::new("Source", SourceModeParam::Sample),
             trim_start: lin("Trim Start", 0.0, 0.0, 30.0, " s").with_step_size(0.01),
             trim_end: lin("Trim End", 0.0, 0.0, 30.0, "").with_step_size(0.01).with_value_to_string(seconds_or("end")).with_string_to_value(s2v_seconds()),
             playback: EnumParam::new("Playback", PlaybackModeParam::Auto),
@@ -725,10 +758,48 @@ impl Default for ChorusParams {
     }
 }
 
+/// Post-FX reverb (`prism_dsp::reverb`), after the chorus.
+#[derive(Params)]
+pub(crate) struct ReverbParams {
+    #[id = "rev_enabled"]
+    pub(crate) enabled: BoolParam,
+    #[id = "rev_size"]
+    pub(crate) size: FloatParam,
+    #[id = "rev_decay"]
+    pub(crate) decay: FloatParam,
+    #[id = "rev_damping"]
+    pub(crate) damping: FloatParam,
+    #[id = "rev_predelay"]
+    pub(crate) predelay: FloatParam,
+    #[id = "rev_width"]
+    pub(crate) width: FloatParam,
+    #[id = "rev_mix"]
+    pub(crate) mix: FloatParam,
+}
+
+impl Default for ReverbParams {
+    fn default() -> Self {
+        let d = prism_dsp::reverb::ReverbSettings::default();
+        Self {
+            enabled: BoolParam::new("Reverb", false),
+            size: pct("Reverb Size", d.size_pct),
+            decay: skew("Reverb Decay", d.decay_seconds, 0.3, 60.0, " s"),
+            damping: FloatParam::new("Reverb Damping", d.damping_hz, FloatRange::Skewed { min: 500.0, max: 20_000.0, factor: FloatRange::skew_factor(-1.5) })
+                .with_unit(" Hz")
+                .with_step_size(10.0)
+                .with_value_to_string(v2s_int()),
+            predelay: lin("Reverb Pre-delay", d.predelay_seconds, 0.0, 0.5, " s").with_step_size(0.001),
+            width: pct("Reverb Width", d.width_pct),
+            mix: pct("Reverb Mix", d.mix_pct),
+        }
+    }
+}
+
 #[derive(Params)]
 pub(crate) struct OutputParams {
-    /// Master volume at the very end of the chain (after the voices, chorus
-    /// and soft limiter), in dB. The bottom of the range is silence.
+    /// Master volume at the end of the chain (after the voices and chorus,
+    /// *before* the safety soft limiter - so turning it down removes limiter
+    /// distortion), in dB. The bottom of the range is silence.
     #[id = "output_volume"]
     pub(crate) volume: FloatParam,
 }
@@ -742,7 +813,6 @@ impl Default for OutputParams {
         Self {
             volume: FloatParam::new("Output Volume", 0.0, FloatRange::Linear { min: OUTPUT_MIN_DB, max: OUTPUT_MAX_DB })
                 .with_step_size(0.1)
-                .with_smoother(SmoothingStyle::Linear(30.0))
                 .with_value_to_string(Arc::new(|db| if db <= OUTPUT_MIN_DB { "-inf dB".into() } else { format!("{db:+.1} dB") })),
         }
     }
@@ -802,5 +872,89 @@ mod format_tests {
         assert_eq!(parse("1.5 s"), Some(1.5));
         assert_eq!(parse("2"), Some(2.0));
         assert_eq!(one_dp(-0.04), "0.0");
+    }
+}
+
+/// The FM Synth source's global settings.
+#[derive(Params)]
+pub(crate) struct FmSourceParams {
+    #[id = "fms_length"]
+    pub(crate) length: FloatParam,
+    #[id = "fms_stereo"]
+    pub(crate) stereo: FloatParam,
+}
+
+impl Default for FmSourceParams {
+    fn default() -> Self {
+        Self {
+            length: lin("FM Source Length", 2.0, 0.5, 10.0, " s").with_step_size(0.1),
+            stereo: lin("FM Source Stereo Spread", 0.0, 0.0, 50.0, " ct").with_step_size(1.0).with_value_to_string(v2s_int()),
+        }
+    }
+}
+
+/// One FM Synth source operator; four are nested as an array (ids get a
+/// `_1`..`_4` suffix). `from1`..`from4` are this operator's modulation
+/// inputs - `fms_from2_1` is "op 2 modulates op 1"; `fromN_N` is feedback.
+#[derive(Params)]
+pub(crate) struct FmOperatorParams {
+    #[id = "fms_wave"]
+    pub(crate) wave: EnumParam<OpWaveParam>,
+    #[id = "fms_coarse"]
+    pub(crate) coarse: IntParam,
+    #[id = "fms_fine"]
+    pub(crate) fine: FloatParam,
+    #[id = "fms_detune"]
+    pub(crate) detune: FloatParam,
+    #[id = "fms_out"]
+    pub(crate) output: FloatParam,
+    #[id = "fms_from1"]
+    pub(crate) from1: FloatParam,
+    #[id = "fms_from2"]
+    pub(crate) from2: FloatParam,
+    #[id = "fms_from3"]
+    pub(crate) from3: FloatParam,
+    #[id = "fms_from4"]
+    pub(crate) from4: FloatParam,
+}
+
+impl FmOperatorParams {
+    /// Defaults for operator `index` (0-based), matching
+    /// `prism_dsp::fm_synth::FmSynthParams::default()`: op 1 is heard and
+    /// modulated by op 2; ops 3/4 sit at x2/x3, silent until routed.
+    pub(crate) fn for_op(index: usize) -> Self {
+        let d = prism_dsp::fm_synth::FmSynthParams::default().ops[index];
+        let n = index + 1;
+        let amount = |from: usize| pct(&format!("Op {from} > Op {n}"), d.mod_from[from - 1]);
+        Self {
+            wave: EnumParam::new(format!("Op {n} Wave"), OpWaveParam::Sine),
+            coarse: IntParam::new(format!("Op {n} Ratio"), d.coarse as i32, IntRange::Linear { min: 0, max: 16 })
+                .with_value_to_string(Arc::new(|v| if v <= 0 { "x0.5".into() } else { format!("x{v}") }))
+                .with_string_to_value(Arc::new(|t| {
+                    let v: f32 = t.trim().trim_start_matches(['x', 'X', '×']).parse().ok()?;
+                    Some(if v < 1.0 { 0 } else { v.round() as i32 })
+                })),
+            fine: lin(&format!("Op {n} Fine"), d.fine_pct, 0.0, 99.0, " %").with_step_size(1.0).with_value_to_string(v2s_int()),
+            detune: lin(&format!("Op {n} Detune"), d.detune_cents, -50.0, 50.0, " ct").with_step_size(1.0).with_value_to_string(v2s_int()),
+            output: pct(&format!("Op {n} Output"), d.output_pct),
+            from1: amount(1),
+            from2: amount(2),
+            from3: amount(3),
+            from4: amount(4),
+        }
+    }
+
+    pub(crate) fn from(&self, source: usize) -> &FloatParam {
+        [&self.from1, &self.from2, &self.from3, &self.from4][source]
+    }
+}
+
+#[cfg(test)]
+mod fm_source_tests {
+    use crate::params::{current_fm_synth, PrismPluginParams};
+
+    #[test]
+    fn plugin_fm_source_defaults_match_the_dsp_defaults() {
+        assert_eq!(current_fm_synth(&PrismPluginParams::default()), prism_dsp::fm_synth::FmSynthParams::default());
     }
 }

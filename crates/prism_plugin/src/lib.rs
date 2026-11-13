@@ -361,19 +361,14 @@ impl Plugin for PrismPlugin {
         let (left, right) = channels.split_at_mut(1);
         self.voices.process_block(&loop_buffer, left[0], right[0]);
 
-        // Output Volume: the very end of the chain, after the soft limiter -
-        // so boosting past 0 dB really can clip, which the meter shows.
-        let mut peak = 0.0f32;
-        for (l, r) in left[0].iter_mut().zip(right[0].iter_mut()) {
-            let gain = output_gain(self.params.output.volume.smoothed.next());
-            *l *= gain;
-            *r *= gain;
-            peak = peak.max(l.abs()).max(r.abs());
-        }
+        // Output Volume is applied inside the voice engine, *before* its
+        // safety limiter (see `apply_realtime_settings`). The meter shows the
+        // final output; the clip light means the limiter was squashing.
+        let peak = left[0].iter().chain(right[0].iter()).fold(0.0f32, |m, v| m.max(v.abs()));
         let shown = f32::from_bits(self.output_peak.load(Ordering::Relaxed));
         let decayed = shown * self.meter_decay_per_sample.powi(buffer.samples() as i32);
         self.output_peak.store(peak.max(decayed).to_bits(), Ordering::Relaxed);
-        if peak >= 1.0 {
+        if self.voices.pre_limit_peak() > 1.0 {
             self.output_clipped.store(true, Ordering::Relaxed);
         }
         // Read *after* process_block so a voice that finished this block is

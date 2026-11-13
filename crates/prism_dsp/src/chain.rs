@@ -16,6 +16,7 @@
 //! - With every stage off the chain is a plain sampler: the (trimmed) source
 //!   is passed through untouched.
 
+use crate::fm_synth::{render_fm_synth, FmSynthParams};
 use crate::fm_transform::{render_fm_transform, FmTransformParams};
 use crate::fusion::{render_fused_loop, FusionRenderParams};
 use crate::microtextures::{render_microtextures, MicroTextureParams};
@@ -28,11 +29,26 @@ use crate::modulate::{
 use crate::percussion::{render_percussion, PercussionParams};
 use crate::render::{LoopBufferData, DEFAULT_LOOP_SECONDS, DEFAULT_ROOT_NOTE};
 
+/// Where Source A's audio comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SourceKind {
+    /// The loaded sample (or the built-in placeholder tone).
+    #[default]
+    Sample,
+    /// The 4-operator FM synth (`fm_synth`), rendered into a buffer that
+    /// stands in for the sample.
+    FmSynth,
+}
+
 /// Every render-time parameter of the instrument. `Copy + PartialEq` so the
 /// plugin's render worker can collapse identical back-to-back requests.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChainParams {
-    // --- Source (plain-sampler mode only) ---
+    // --- Source ---
+    pub source_kind: SourceKind,
+    /// Used when `source_kind == FmSynth`.
+    pub fm_synth: FmSynthParams,
+    // Trim: plain-sampler mode with a sample source only.
     /// Trim start in seconds.
     pub trim_start_sec: f32,
     /// Trim end in seconds; 0 (or <= start) = to the end of the sample.
@@ -66,6 +82,8 @@ pub struct ChainParams {
 impl Default for ChainParams {
     fn default() -> Self {
         Self {
+            source_kind: SourceKind::Sample,
+            fm_synth: FmSynthParams::default(),
             trim_start_sec: 0.0,
             trim_end_sec: 0.0,
             fm_enabled: false,
@@ -152,6 +170,21 @@ fn shortest_len(channels: &[Vec<f32>]) -> usize {
     channels.iter().map(Vec::len).min().unwrap_or(0)
 }
 
+fn rms(channels: &[Vec<f32>]) -> f32 {
+    let count = channels.iter().map(Vec::len).sum::<usize>().max(1);
+    (channels.iter().flatten().map(|v| v * v).sum::<f32>() / count as f32).sqrt()
+}
+
+/// Scales `channels` to `target_rms`, capped so the peak stays <= 1.0.
+fn match_loudness(channels: &mut [Vec<f32>], target_rms: f32) {
+    let current = rms(channels);
+    let peak = channels.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));
+    if current > 1e-9 && peak.is_finite() && peak > 0.0 {
+        let scale = (target_rms / current).min(1.0 / peak);
+        channels.iter_mut().flatten().for_each(|v| *v *= scale);
+    }
+}
+
 /// `[start, end)` sample range for a start/length-or-end pair in seconds.
 fn slice_range(total: usize, sample_rate: f32, start_sec: f32, end: Option<f32>) -> (usize, usize) {
     let start = ((start_sec.max(0.0) * sample_rate).round() as usize).min(total);
@@ -193,8 +226,24 @@ pub fn passthrough(source_a: &[Vec<f32>], sample_rate: f32, trim_start_sec: f32,
 /// channel; an empty `source_b` degrades B-requiring fusion modes to Off
 /// (see `fusion::effective_mode`, applied by the caller).
 pub fn render_chain(params: &ChainParams, source_a: &[Vec<f32>], source_b: &[Vec<f32>], sample_rate: f32) -> LoopBufferData {
+    // Resolve Source A: the FM synth's buffer stands in for the sample
+    // everywhere below (the loaded sample itself is left untouched).
+    let synth;
+    let source_a: &[Vec<f32>] = match params.source_kind {
+        SourceKind::Sample => source_a,
+        SourceKind::FmSynth => {
+            synth = render_fm_synth(&params.fm_synth, sample_rate, DEFAULT_ROOT_NOTE);
+            &synth
+        }
+    };
     if !params.renders() || shortest_len(source_a) == 0 {
-        return passthrough(source_a, sample_rate, params.trim_start_sec, params.trim_end_sec);
+        // Trim only applies to a loaded sample; the synth buffer is generated
+        // at the length asked for.
+        let (start, end) = match params.source_kind {
+            SourceKind::Sample => (params.trim_start_sec, params.trim_end_sec),
+            SourceKind::FmSynth => (0.0, 0.0),
+        };
+        return passthrough(source_a, sample_rate, start, end);
     }
 
     // FM pre-stage on (a slice of) Sample A.
@@ -205,7 +254,13 @@ pub fn render_chain(params: &ChainParams, source_a: &[Vec<f32>], source_b: &[Vec
         let (start, end) = slice_range(total, sample_rate, params.fm_slice_start_sec, length_end);
         if end > start {
             let slice = slice_channels(source_a, start, end);
-            fm_output = Some(render_fm_transform(&slice, sample_rate, DEFAULT_ROOT_NOTE, &params.fm));
+            let mut out = render_fm_transform(&slice, sample_rate, DEFAULT_ROOT_NOTE, &params.fm);
+            // The transform's carrier runs at full amplitude whatever the
+            // input level, roughly doubling the loudness and driving the
+            // voice engine's limiter into distortion - match it back to the
+            // input's loudness (never above full-scale peak).
+            match_loudness(&mut out, rms(&slice));
+            fm_output = Some(out);
         }
     }
     let a: &[Vec<f32>] = fm_output.as_deref().unwrap_or(source_a);
@@ -381,5 +436,31 @@ mod tests {
         let p = ChainParams { fm_enabled: true, percussion_enabled: true, micro_enabled: true, ..ChainParams::default() };
         let out = render_chain(&p, &[Vec::new()], &[], SR);
         assert_eq!(out.channels.len(), 2);
+    }
+
+    #[test]
+    fn fm_source_with_every_stage_off_plays_the_synth_buffer() {
+        let p = ChainParams { source_kind: SourceKind::FmSynth, trim_start_sec: 0.5, ..all_off() };
+        let out = render_chain(&p, &source(0.1), &[], SR);
+        let synth = render_fm_synth(&p.fm_synth, SR, DEFAULT_ROOT_NOTE);
+        assert_eq!(out.channels, synth, "trim is ignored and the sample is not used");
+    }
+
+    #[test]
+    fn fm_source_through_spectral_renders_a_loop() {
+        let p = ChainParams { source_kind: SourceKind::FmSynth, loop_length_seconds: 1.0, ..ChainParams::default() };
+        // An empty Sample A must not matter in FM mode.
+        assert_audible(&render_chain(&p, &[Vec::new()], &[], SR));
+    }
+
+    #[test]
+    fn fm_transform_output_is_level_matched_to_its_input() {
+        let src = source(1.0); // a 0.8-peak sine, rms ~0.57
+        let quiet: Vec<Vec<f32>> = src.iter().map(|c| c.iter().map(|v| v * 0.25).collect()).collect();
+        let p = ChainParams { fm_enabled: true, ..all_off() };
+        let out = render_chain(&p, &quiet, &[], SR);
+        let (rin, rout) = (rms(&quiet), rms(&out.channels));
+        assert!((rout - rin).abs() < 0.02, "in {rin} out {rout}");
+        assert!(out.channels.iter().flatten().all(|v| v.abs() <= 1.0));
     }
 }

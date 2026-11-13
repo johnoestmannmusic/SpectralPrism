@@ -596,7 +596,9 @@ pub(crate) fn draw_chord_keys(ui: &mut egui::Ui, intervals: &[i32], scale: f32) 
 /// (the fill is the current output peak, on the same dB scale as the
 /// control) and the slider (the dark marker is the volume setting - click
 /// or drag anywhere to move it, double-click to reset to 0 dB). The fill
-/// turns red while `clipping` (the output reached 0 dBFS recently).
+/// turns red while `clipping` (the level going into the safety limiter
+/// went over 0 dBFS recently - the limiter was squashing it).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_output_meter(
     ui: &mut egui::Ui,
     volume: &FloatParam,
@@ -648,5 +650,133 @@ pub(crate) fn draw_output_meter(
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }
-    response.on_hover_text("Output Volume - drag to set, double-click for 0 dB. The bar shows the output level; red means it hit 0 dBFS (clipping).")
+    response.on_hover_text("Output Volume - drag to set, double-click for 0 dB. The bar shows the output level; red means the signal went over 0 dB and the safety limiter is squashing it (audible distortion) - turn the volume down.")
+}
+
+// ------------------------------------------------------------------------
+// FM Synth source
+// ------------------------------------------------------------------------
+
+/// One routing-matrix cell: a small box whose fill shows the amount
+/// (0-100 %). Drag up/down to set, double-click for 0. `feedback` marks the
+/// diagonal (an operator modulating itself).
+pub(crate) fn matrix_cell(ui: &mut egui::Ui, param: &FloatParam, setter: &ParamSetter, feedback: bool, scale: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 22.0) * scale, egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    let value = param.unmodulated_normalized_value();
+    painter.rect_filled(rect, 2.0, if feedback { COLOR_PANEL } else { COLOR_SURFACE_DEEP });
+    if value > 0.0 {
+        let top = rect.bottom() - rect.height() * value;
+        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), top), rect.max), 2.0, COLOR_ACCENT);
+    }
+    let stroke = if response.hovered() || response.dragged() { COLOR_INK } else { COLOR_EDGE };
+    painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, stroke), egui::StrokeKind::Inside);
+    let text = if value > 0.0 { format!("{:.0}", param.unmodulated_plain_value()) } else if feedback { "fb".into() } else { "·".into() };
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(10.0 * scale), if value > 0.0 { COLOR_INK } else { COLOR_DIM });
+
+    if response.double_clicked() {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, 0.0);
+        setter.end_set_parameter(param);
+    } else {
+        if response.drag_started() {
+            setter.begin_set_parameter(param);
+        }
+        if response.dragged() {
+            let delta = -response.drag_delta().y / (120.0 * scale);
+            setter.set_parameter_normalized(param, (param.unmodulated_normalized_value() + delta).clamp(0.0, 1.0));
+        }
+        if response.drag_stopped() {
+            setter.end_set_parameter(param);
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    response
+}
+
+fn arrow_head(painter: &egui::Painter, tip: egui::Pos2, dir: egui::Vec2, size: f32, color: egui::Color32) {
+    let d = dir.normalized();
+    let n = egui::vec2(-d.y, d.x);
+    painter.add(egui::Shape::convex_polygon(vec![tip, tip - d * size + n * size * 0.55, tip - d * size - n * size * 0.55], color, egui::Stroke::NONE));
+}
+
+/// A live picture of the FM Synth routing: four operator nodes in a row
+/// (filled = heard), an arc for every modulation (thicker = stronger;
+/// higher-numbered sources arc over the top, lower-numbered underneath), a
+/// loop above an operator with feedback, and drops into the OUT bar for
+/// every operator with output.
+pub(crate) fn draw_fm_routing(ui: &mut egui::Ui, fm: &prism_dsp::fm_synth::FmSynthParams, scale: f32) {
+    use prism_dsp::fm_synth::OPS;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 120.0 * scale), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, COLOR_SURFACE_DEEP);
+    let r = 11.0 * scale;
+    let node_y = rect.top() + rect.height() * 0.42;
+    let bar_y = rect.bottom() - 12.0 * scale;
+    let node = |i: usize| egui::pos2(rect.left() + rect.width() * (i as f32 * 2.0 + 1.0) / (OPS as f32 * 2.0), node_y);
+    let width = |pct: f32| (pct / 100.0) * 3.0 * scale + 0.75;
+
+    // OUT bar and drops.
+    painter.line_segment([egui::pos2(rect.left() + 8.0 * scale, bar_y), egui::pos2(rect.right() - 8.0 * scale, bar_y)], egui::Stroke::new(2.0_f32, COLOR_EDGE_HOVER));
+    painter.text(egui::pos2(rect.right() - 8.0 * scale, bar_y - 3.0 * scale), egui::Align2::RIGHT_BOTTOM, "OUT", egui::FontId::proportional(8.5 * scale), COLOR_DIM);
+    for (i, op) in fm.ops.iter().enumerate() {
+        if op.output_pct > 0.0 {
+            let p = node(i);
+            painter.line_segment([egui::pos2(p.x, p.y + r), egui::pos2(p.x, bar_y)], egui::Stroke::new(width(op.output_pct), COLOR_INK));
+        }
+    }
+    // Modulation arcs.
+    for (dst, op) in fm.ops.iter().enumerate() {
+        for (src, &amt) in op.mod_from.iter().enumerate() {
+            if amt <= 0.0 {
+                continue;
+            }
+            let stroke = egui::Stroke::new(width(amt), COLOR_ACCENT);
+            if src == dst {
+                let c = node(dst) - egui::vec2(0.0, r * 1.7);
+                painter.circle_stroke(c, r * 0.7, stroke);
+                continue;
+            }
+            let (a, b) = (node(src), node(dst));
+            let up = if src > dst { -1.0 } else { 1.0 };
+            let span = (b.x - a.x).abs();
+            let lift = up * (r * 1.2 + span * 0.18);
+            let start = a + egui::vec2(0.0, up * r);
+            let end = b + egui::vec2(0.0, up * r);
+            let ctrl = egui::pos2((a.x + b.x) * 0.5, a.y + lift * 1.6);
+            painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke([start, ctrl, end], false, egui::Color32::TRANSPARENT, stroke));
+            arrow_head(painter, end, end - ctrl, 6.0 * scale, COLOR_ACCENT);
+        }
+    }
+    // Nodes on top.
+    for (i, op) in fm.ops.iter().enumerate() {
+        let p = node(i);
+        let used = op.output_pct > 0.0 || fm.ops.iter().enumerate().any(|(d, o)| d != i && o.mod_from[i] > 0.0);
+        let fill = if op.output_pct > 0.0 { COLOR_ACCENT } else { COLOR_PANEL };
+        painter.circle(p, r, fill, egui::Stroke::new(1.0_f32, if used { COLOR_INK } else { COLOR_EDGE }));
+        painter.text(p, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(11.0 * scale), if used { COLOR_INK } else { COLOR_DIM });
+    }
+}
+
+/// A few cycles of a waveform (normalised samples).
+pub(crate) fn draw_cycle_preview(ui: &mut egui::Ui, samples: &[f32], scale: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0 * scale), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, COLOR_SURFACE_DEEP);
+    painter.line_segment([egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)], egui::Stroke::new(1.0_f32, COLOR_EDGE));
+    if samples.len() > 1 {
+        let half = rect.height() * 0.42;
+        let points: Vec<egui::Pos2> = (0..rect.width().max(2.0) as usize)
+            .map(|px| {
+                let i = (px as f32 / rect.width() * (samples.len() - 1) as f32) as usize;
+                egui::pos2(rect.left() + px as f32, rect.center().y - samples[i].clamp(-1.0, 1.0) * half)
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.5_f32, COLOR_INK)));
+    } else {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "(silent - give an operator some Output)", egui::FontId::proportional(10.0 * scale), COLOR_DIM);
+    }
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, COLOR_EDGE), egui::StrokeKind::Inside);
 }
