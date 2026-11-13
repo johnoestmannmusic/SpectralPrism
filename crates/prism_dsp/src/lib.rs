@@ -10,6 +10,8 @@ pub mod fft;
 pub mod formant;
 pub mod freeze;
 pub mod fusion;
+pub mod modulate;
+pub mod percussion;
 pub mod phase_advance;
 pub mod render;
 pub mod resample;

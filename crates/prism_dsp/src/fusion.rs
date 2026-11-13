@@ -267,7 +267,7 @@ fn render_pre_resynth_fusion(
     LoopBufferData { channels, sample_rate, root_note }
 }
 
-fn combine_spectra(a: &FrozenSpectrum, b: &FrozenSpectrum, mode: FusionMode, amount_pct: f32, fft: &FreezeFft) -> FrozenSpectrum {
+pub(crate) fn combine_spectra(a: &FrozenSpectrum, b: &FrozenSpectrum, mode: FusionMode, amount_pct: f32, fft: &FreezeFft) -> FrozenSpectrum {
     match mode {
         FusionMode::CrossSynth => cross_synth(a, b, amount_pct, fft),
         FusionMode::Convolve => convolve(a, b, amount_pct),
